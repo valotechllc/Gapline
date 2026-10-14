@@ -1,4 +1,4 @@
--- NIST 800-171 Rev 2 Assessment Tool — Control Library & Assessment Schema (PostgreSQL)
+-- NIST 800-171 Rev 2 Assessment Tool — Control Library & Assessment Schema (PostgreSQL 13+; tested on 16)
 -- Design rule: the LIBRARY tables are static reference data you own and version.
 -- The ASSESSMENT tables are per-customer. The LLM never writes scores directly.
 
@@ -20,6 +20,9 @@ CREATE TABLE control_family (
     name            TEXT NOT NULL            -- 'Access Control'
 );
 
+-- NOTE: id alone is the primary key, so each requirement/objective can exist under only ONE
+-- library_version. A second scoring version for Rev 2 (same IDs, different weights or text)
+-- can't sit beside the first. Move to (library_version, id) keys before loading a second version.
 CREATE TABLE requirement (
     id              TEXT PRIMARY KEY,        -- '3.5.3'
     library_version INT  NOT NULL REFERENCES library_version(id),
@@ -28,10 +31,14 @@ CREATE TABLE requirement (
     title           TEXT NOT NULL,
     statement       TEXT NOT NULL,           -- official requirement text
     plain_english   TEXT,                    -- your rewrite for the interview UI
-    sprs_weight     SMALLINT NOT NULL CHECK (sprs_weight IN (1,3,5)),
+    sprs_weight     SMALLINT,                -- 1, 3 or 5. May be NULL only where blocks_scoring (3.12.4),
+                                             -- whose failure voids the score instead of deducting points
     partial_rule    JSONB,                   -- partial-credit logic, e.g. 3.5.3, 3.13.11 (see seed below)
-    poam_eligible   BOOLEAN NOT NULL,        -- can it sit on a POA&M under the CMMC rule?
-    blocks_scoring  BOOLEAN NOT NULL DEFAULT FALSE  -- 3.12.4: no SSP = no valid score at all
+    poam_eligible   BOOLEAN NOT NULL,        -- can it sit on a POA&M under the CMMC rule? (necessary, not
+                                             -- sufficient: see POA&M note in section 3)
+    blocks_scoring  BOOLEAN NOT NULL DEFAULT FALSE,  -- 3.12.4: no SSP = no valid score at all
+    CHECK ((sprs_weight IS NOT NULL AND sprs_weight IN (1,3,5))
+        OR (sprs_weight IS NULL AND blocks_scoring))
 );
 
 CREATE TABLE assessment_objective (
@@ -46,7 +53,7 @@ CREATE TABLE assessment_objective (
 CREATE TABLE check_rule (
     id              TEXT PRIMARY KEY,        -- 'IA-MFA-ALL-USERS'
     description     TEXT NOT NULL,
-    source          TEXT NOT NULL,           -- 'graph', 'exo_powershell', 'intune'
+    source          TEXT NOT NULL,           -- 'graph', 'exo_powershell', 'scc_powershell', 'intune'
     logic           JSONB NOT NULL,          -- declarative condition evaluated by your engine
     license_needed  TEXT                     -- 'Entra ID P1' etc. — flag when missing, don't fail silently
 );
@@ -86,20 +93,38 @@ CREATE TABLE assessment (
                         CHECK (status IN ('in_progress','in_review','signed','superseded')),
     signed_by       TEXT,                    -- the human who attests (senior official for SPRS)
     signed_at       TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (status <> 'signed' OR (signed_by IS NOT NULL AND signed_at IS NOT NULL))
 );
 
 -- Raw evidence, immutable. Hash it so you can prove what you saw and when.
+-- Hash the raw bytes as received and keep those bytes at file_uri. Don't hash payload:
+-- JSONB reorders keys, strips whitespace and drops duplicate keys, so the stored payload
+-- will not reproduce the hash of what the API actually returned.
 CREATE TABLE evidence_item (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    source          TEXT NOT NULL,           -- 'graph', 'upload', 'interview'
+    source          TEXT NOT NULL,           -- 'graph', 'exo_powershell', 'upload', 'interview'
     collector       TEXT,
-    payload         JSONB,                   -- raw API response or interview answer
-    file_uri        TEXT,                    -- for uploads (object storage, not the DB)
-    sha256          TEXT NOT NULL,
-    collected_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    payload         JSONB,                   -- parsed copy for querying; not the evidence of record
+    file_uri        TEXT,                    -- raw bytes in object storage (API responses and uploads)
+    sha256          TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),  -- of file_uri bytes; of payload::text for interviews
+    collected_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (file_uri IS NOT NULL OR (source = 'interview' AND payload IS NOT NULL)),
+    UNIQUE (id, assessment_id)               -- lets objective_evidence pin evidence to its own assessment
 );
+
+-- Enforce "immutable". This only stops the application role: whoever owns the table can
+-- drop the trigger, so the app must not connect as the table owner.
+CREATE FUNCTION reject_evidence_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'evidence_item is append-only (% rejected)', TG_OP;
+END $$;
+
+CREATE TRIGGER evidence_item_no_update_delete BEFORE UPDATE OR DELETE ON evidence_item
+    FOR EACH ROW EXECUTE FUNCTION reject_evidence_change();
+CREATE TRIGGER evidence_item_no_truncate BEFORE TRUNCATE ON evidence_item
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_change();
 
 -- One row per objective per assessment. Three separate opinions, kept apart on purpose.
 CREATE TABLE objective_result (
@@ -112,16 +137,38 @@ CREATE TABLE objective_result (
     human_result    TEXT CHECK (human_result IN ('met','not_met','not_applicable')),
     reviewer        TEXT,
     reviewed_at     TIMESTAMPTZ,
-    PRIMARY KEY (assessment_id, objective_id)
+    PRIMARY KEY (assessment_id, objective_id),
+    CHECK (human_result IS NULL OR (reviewer IS NOT NULL AND reviewed_at IS NOT NULL)),
+    CHECK (ai_result IS NULL OR ai_model IS NOT NULL)
 );
 
 CREATE TABLE objective_evidence (            -- which evidence supports which objective
     assessment_id   UUID NOT NULL,
     objective_id    TEXT NOT NULL,
-    evidence_id     UUID NOT NULL REFERENCES evidence_item(id),
+    evidence_id     UUID NOT NULL,
     PRIMARY KEY (assessment_id, objective_id, evidence_id),
-    FOREIGN KEY (assessment_id, objective_id) REFERENCES objective_result(assessment_id, objective_id)
+    FOREIGN KEY (assessment_id, objective_id) REFERENCES objective_result(assessment_id, objective_id),
+    -- Same assessment_id on both sides, so one customer's evidence can't back another's objective.
+    FOREIGN KEY (evidence_id, assessment_id) REFERENCES evidence_item(id, assessment_id)
 );
+
+-- Once an assessment is signed, the results it attests to can't change underneath the signature.
+-- To revise, start a new assessment and mark the old one 'superseded'.
+CREATE FUNCTION reject_change_if_signed() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM assessment
+               WHERE status IN ('signed','superseded')
+                 AND id IN (CASE WHEN TG_OP <> 'INSERT' THEN OLD.assessment_id END,
+                            CASE WHEN TG_OP <> 'DELETE' THEN NEW.assessment_id END)) THEN
+        RAISE EXCEPTION '% on % rejected: assessment is signed or superseded', TG_OP, TG_TABLE_NAME;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+CREATE TRIGGER objective_result_lock BEFORE INSERT OR UPDATE OR DELETE ON objective_result
+    FOR EACH ROW EXECUTE FUNCTION reject_change_if_signed();
+CREATE TRIGGER objective_evidence_lock BEFORE INSERT OR UPDATE OR DELETE ON objective_evidence
+    FOR EACH ROW EXECUTE FUNCTION reject_change_if_signed();
 
 -- SSP narrative per requirement (AI drafts, human edits).
 CREATE TABLE ssp_narrative (
@@ -150,25 +197,42 @@ CREATE TABLE poam_item (
 -- 3. SCORING — derived only from HUMAN results
 -- =========================================================
 -- A requirement is MET only if every one of its objectives is met (or N/A).
+-- Driven from the library, not from objective_result: an objective with no result row,
+-- or a requirement with no rows at all, must come out 'unreviewed' rather than vanish
+-- (a vanished requirement means a missed deduction and an inflated score).
 CREATE VIEW requirement_status AS
 SELECT
-    o.assessment_id,
+    a.id AS assessment_id,
     r.id AS requirement_id,
     r.sprs_weight,
     r.partial_rule,
+    r.blocks_scoring,
+    count(ao.id)          AS objectives_total,
+    count(o.human_result) AS objectives_reviewed,
     CASE
-        WHEN bool_and(o.human_result IS NOT NULL) IS NOT TRUE THEN 'unreviewed'
+        -- No objectives loaded for this requirement is a library seeding error; fail closed.
+        WHEN count(ao.id) = 0 THEN 'unreviewed'
+        WHEN count(o.human_result) < count(ao.id) THEN 'unreviewed'
         WHEN bool_and(o.human_result IN ('met','not_applicable')) THEN 'met'
         ELSE 'not_met'
     END AS status
-FROM objective_result o
-JOIN assessment_objective ao ON ao.id = o.objective_id
-JOIN requirement r ON r.id = ao.requirement_id
-GROUP BY o.assessment_id, r.id, r.sprs_weight, r.partial_rule;
+FROM assessment a
+JOIN requirement r                ON r.library_version = a.library_version
+LEFT JOIN assessment_objective ao ON ao.requirement_id = r.id
+LEFT JOIN objective_result o      ON o.assessment_id = a.id AND o.objective_id = ao.id
+GROUP BY a.id, r.id;
 
 -- Final SPRS math (110 minus deductions, floor -203) lives in application code,
 -- where partial_rule can be evaluated and unit-tested against known examples.
 -- Refuse to output a score if any requirement is 'unreviewed' or 3.12.4 is not met.
+--
+-- POA&M eligibility is not a per-requirement fact, so poam_eligible alone can't decide it.
+-- As commonly summarized from 32 CFR 170.21 (verify against the eCFR text before relying on it):
+--   * the assessment score must be at least 80% of the maximum (88/110);
+--   * only 1-point requirements, plus 3.13.11 when the deduction is the partial (-3,
+--     encryption used but not FIPS-validated) one;
+--   * never 3.1.20, 3.1.22, 3.12.4, 3.10.3, 3.10.4, 3.10.5, even though most are 1-pointers;
+--   * close-out within 180 days.
 
 -- =========================================================
 -- 4. EXAMPLE SEED ROWS
