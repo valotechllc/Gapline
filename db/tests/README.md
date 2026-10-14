@@ -8,7 +8,7 @@ db/tests/run.sh freeze     # only files whose name contains "freeze"
 KEEP_DBS=1 db/tests/run.sh # keep each test database for inspection
 ```
 
-The runner exits non-zero if any file fails, so it can run as-is in CI.
+The runner exits non-zero if any file fails. In CI, `.github/workflows/db-tests.yml` runs it against PostgreSQL 15, 16, 17 and 18 on every pull request and every push to `main`.
 
 ## Requirements
 

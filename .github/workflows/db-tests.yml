@@ -1,0 +1,52 @@
+name: Database tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  db-tests:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 15 is the floor for the suite: 07_ssp_digest_collation creates an ICU database.
+        pg: ['15', '16', '17', '18']
+    # Run the steps in the same image as the server, so psql/createdb/dropdb always match the
+    # PostgreSQL version under test.
+    container: postgres:${{ matrix.pg }}
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Server and client versions
+        run: |
+          psql -X -Atc 'select version()'
+          psql --version
+
+      - name: Run db/tests
+        run: bash db/tests/run.sh
