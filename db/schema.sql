@@ -22,7 +22,7 @@ CREATE TABLE control_family (
 
 -- Library rows are keyed by (library_version, id), so a new version can reuse the Rev 2 IDs
 -- ('3.5.3') with different weights or text and sit beside the old one. Every table that points
--- at a requirement or objective carries library_version too.
+-- at a requirement, objective or check rule carries library_version too.
 CREATE TABLE requirement (
     id              TEXT NOT NULL,           -- '3.5.3'
     library_version INT  NOT NULL REFERENCES library_version(id),
@@ -54,12 +54,16 @@ CREATE TABLE assessment_objective (
 );
 
 -- Deterministic checks. Code decides these, not the model.
+-- Versioned like requirements: to change a rule's logic, add it under a new library_version
+-- rather than editing it, so re-running an old assessment still evaluates the way it did.
 CREATE TABLE check_rule (
-    id              TEXT PRIMARY KEY,        -- 'IA-MFA-ALL-USERS'
+    id              TEXT NOT NULL,           -- 'IA-MFA-ALL-USERS'
+    library_version INT  NOT NULL REFERENCES library_version(id),
     description     TEXT NOT NULL,
     source          TEXT NOT NULL,           -- 'graph', 'exo_powershell', 'scc_powershell', 'intune'
     logic           JSONB NOT NULL,          -- declarative condition evaluated by your engine
-    license_needed  TEXT                     -- 'Entra ID P1' etc. — flag when missing, don't fail silently
+    license_needed  TEXT,                    -- 'Entra ID P1' etc. — flag when missing, don't fail silently
+    PRIMARY KEY (library_version, id)
 );
 
 -- How each objective CAN be evidenced. One objective -> many methods.
@@ -70,10 +74,11 @@ CREATE TABLE evidence_method (
     method_type     TEXT NOT NULL CHECK (method_type IN
                         ('automated_check','interview','document','screenshot','attestation')),
     collector       TEXT,                    -- 'graph.conditional_access', 'exo.mailbox_audit', NULL for manual
-    rule_id         TEXT REFERENCES check_rule(id),   -- deterministic rule, if automated
+    rule_id         TEXT,                    -- deterministic rule, if automated (same library_version)
     interview_prompt TEXT,                   -- question asked when no automated source exists
     assessor_guidance TEXT,                  -- what an assessor would want to see
-    FOREIGN KEY (library_version, objective_id) REFERENCES assessment_objective(library_version, id)
+    FOREIGN KEY (library_version, objective_id) REFERENCES assessment_objective(library_version, id),
+    FOREIGN KEY (library_version, rule_id) REFERENCES check_rule(library_version, id)
 );
 
 -- =========================================================
