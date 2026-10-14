@@ -114,8 +114,16 @@ CREATE TABLE assessment (
 -- A signed assessment can't be un-signed or edited (that would lift every lock below and
 -- rewrite the attestation). Its only allowed change is signed -> superseded, with every other
 -- column unchanged; superseded is final. Neither can be deleted. No-op updates pass.
+-- Assessments can't be created already signed: signing must be an update, so the SSP
+-- snapshot trigger (see ssp_snapshot) runs for every signed assessment.
 CREATE FUNCTION guard_signed_assessment() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status = 'signed' THEN
+            RAISE EXCEPTION 'insert on assessment rejected: create it unsigned, then sign it by update';
+        END IF;
+        RETURN NEW;
+    END IF;
     IF TG_OP = 'UPDATE' AND to_jsonb(NEW) = to_jsonb(OLD) THEN
         RETURN NEW;
     END IF;
@@ -129,7 +137,7 @@ BEGIN
     RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END $$;
 
-CREATE TRIGGER assessment_signed_guard BEFORE UPDATE OR DELETE ON assessment
+CREATE TRIGGER assessment_signed_guard BEFORE INSERT OR UPDATE OR DELETE ON assessment
     FOR EACH ROW EXECUTE FUNCTION guard_signed_assessment();
 
 -- Freeze a library version once any assessment on it is signed or superseded: no inserts,
@@ -203,15 +211,15 @@ CREATE TABLE evidence_item (
 
 -- Enforce "immutable". This only stops the application role: whoever owns the table can
 -- drop the trigger, so the app must not connect as the table owner.
-CREATE FUNCTION reject_evidence_change() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION reject_append_only_change() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE EXCEPTION 'evidence_item is append-only (% rejected)', TG_OP;
+    RAISE EXCEPTION '% is append-only (% rejected)', TG_TABLE_NAME, TG_OP;
 END $$;
 
 CREATE TRIGGER evidence_item_no_update_delete BEFORE UPDATE OR DELETE ON evidence_item
-    FOR EACH ROW EXECUTE FUNCTION reject_evidence_change();
+    FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
 CREATE TRIGGER evidence_item_no_truncate BEFORE TRUNCATE ON evidence_item
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_evidence_change();
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
 
 -- One row per objective per assessment. Three separate opinions, kept apart on purpose.
 CREATE TABLE objective_result (
@@ -268,6 +276,7 @@ CREATE TRIGGER assessment_no_truncate BEFORE TRUNCATE ON assessment
     FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 
 -- SSP narrative per requirement (AI drafts, human edits).
+-- The living document: stays editable after signing. What was signed is in ssp_snapshot.
 CREATE TABLE ssp_narrative (
     assessment_id   UUID NOT NULL,
     library_version INT  NOT NULL,           -- filled from the assessment if omitted; must match it (FK)
@@ -279,6 +288,55 @@ CREATE TABLE ssp_narrative (
     FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
     FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
+
+-- The SSP exactly as it stood when the assessment was signed: one row per ssp_narrative row,
+-- copied by trigger in the same transaction as the signing. Append-only, and only that
+-- trigger may write it. A signed assessment with no rows here had no SSP sections at signing.
+CREATE TABLE ssp_snapshot (
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,
+    requirement_id  TEXT NOT NULL,
+    draft_text      TEXT,
+    final_text      TEXT,
+    edited_by       TEXT,
+    snapshot_at     TIMESTAMPTZ NOT NULL DEFAULT now(),  -- transaction time of the signing
+    PRIMARY KEY (assessment_id, requirement_id),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
+);
+
+CREATE FUNCTION snapshot_ssp_on_sign() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO ssp_snapshot (assessment_id, library_version, requirement_id,
+                              draft_text, final_text, edited_by)
+    SELECT assessment_id, library_version, requirement_id, draft_text, final_text, edited_by
+    FROM ssp_narrative
+    WHERE assessment_id = NEW.id;
+    RETURN NULL;
+END $$;
+
+-- AFTER, so it only runs once the signing has passed the guard and the CHECK constraints.
+-- The guard makes 'signed' reachable once per assessment, so this fires at most once.
+CREATE TRIGGER assessment_ssp_snapshot AFTER UPDATE ON assessment
+    FOR EACH ROW WHEN (OLD.status <> 'signed' AND NEW.status = 'signed')
+    EXECUTE FUNCTION snapshot_ssp_on_sign();
+
+-- Rows may only come from snapshot_ssp_on_sign: a direct INSERT runs at trigger depth 1,
+-- the copy inside the signing trigger at depth 2. Stops backfilled or invented snapshots.
+CREATE FUNCTION reject_direct_snapshot_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF pg_trigger_depth() < 2 THEN
+        RAISE EXCEPTION 'ssp_snapshot is written only by signing an assessment';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ssp_snapshot_insert_guard BEFORE INSERT ON ssp_snapshot
+    FOR EACH ROW EXECUTE FUNCTION reject_direct_snapshot_insert();
+CREATE TRIGGER ssp_snapshot_no_update_delete BEFORE UPDATE OR DELETE ON ssp_snapshot
+    FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
+CREATE TRIGGER ssp_snapshot_no_truncate BEFORE TRUNCATE ON ssp_snapshot
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
 
 CREATE TABLE poam_item (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
