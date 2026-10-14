@@ -1,0 +1,435 @@
+<!doctype html>
+<!-- Hand-drawn from db/schema.sql at eb5b16f (inline SVG, no build step).
+     It does not update itself: when the schema changes, update the drawings and the eyebrow commit. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gapline Schema</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+body { margin: 0; }
+/* Layout: one reading column for prose, full-width figure sheets for the three drawings, a reference table at the end. */
+:root {
+  --bg: #f2f4f7;
+  --sheet: #ffffff;
+  --panel: #f6f8fb;
+  --ink: #17202c;
+  --muted: #5b6677;
+  --line: #c8d0db;
+  --accent: #2456b8;
+  --accent-soft: #e4ecfa;
+  --deny: #b3261e;
+  --ok: #1d7a55;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  --sans: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0c1118; --sheet: #121a24; --panel: #172130; --ink: #e5eaf1; --muted: #9aa6b8;
+    --line: #2d3a4b; --accent: #82a9f2; --accent-soft: #1b2b47; --deny: #f2958a; --ok: #74d0a6;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0c1118; --sheet: #121a24; --panel: #172130; --ink: #e5eaf1; --muted: #9aa6b8;
+  --line: #2d3a4b; --accent: #82a9f2; --accent-soft: #1b2b47; --deny: #f2958a; --ok: #74d0a6;
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 15px/1.6 var(--sans);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+main { max-width: 1120px; margin: 0 auto; padding-block: 40px 64px; display: grid; gap: 48px; }
+a { color: var(--accent); }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+code { font-family: var(--mono); font-size: 0.88em; }
+
+header { display: grid; gap: 12px; max-width: 72ch; }
+.eyebrow { font: 500 12px var(--mono); color: var(--muted); letter-spacing: 0.02em; }
+h1 { font: 600 clamp(32px, 5vw, 44px)/1.05 var(--display); margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+.lede { margin: 0; font-size: 17px; color: var(--ink); }
+.meta { margin: 0; font: 400 13px var(--mono); color: var(--muted); }
+
+section { display: grid; gap: 16px; }
+h2 { font: 600 24px/1.2 var(--display); margin: 0; text-wrap: balance; }
+.prose { max-width: 70ch; margin: 0; }
+
+figure { margin: 0; display: grid; gap: 14px; }
+.sheet { background: var(--sheet); border: 1px solid var(--line); border-radius: 12px; padding: 20px; min-width: 0; }
+.scroll { overflow-x: auto; }
+figcaption { max-width: 72ch; color: var(--muted); font-size: 14px; }
+figcaption strong { color: var(--ink); font-weight: 600; }
+
+svg.dia { display: block; width: 100%; height: auto; }
+svg.er { min-width: 880px; }
+svg.life { min-width: 760px; }
+svg.locks { min-width: 720px; }
+
+/* drawing classes, all from the theme tokens */
+.box { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+.box.view { fill: none; stroke-dasharray: 4 3; }
+.box.hub { fill: var(--sheet); stroke: var(--ink); stroke-width: 1.2; }
+.frame { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 2 4; }
+.tn { fill: var(--ink); font: 600 12.5px var(--mono); }
+.tk { fill: var(--muted); font: 400 11px var(--mono); }
+.note { fill: var(--muted); font: italic 400 11px var(--sans); }
+.band { fill: var(--muted); font: 600 10.5px var(--sans); letter-spacing: 0.08em; }
+.tag { font: 600 9.5px var(--sans); letter-spacing: 0.06em; }
+.tag.lock { fill: var(--deny); }
+.tag.append { fill: var(--ink); }
+.tag.edit { fill: var(--ok); }
+.tag.view { fill: var(--muted); }
+.tag.frozen { fill: var(--accent); }
+.edge { stroke: var(--muted); stroke-width: 1.25; fill: none; }
+.edge.v { stroke: var(--accent); stroke-width: 1.6; }
+.edge.deny { stroke: var(--deny); stroke-width: 1.4; stroke-dasharray: 5 4; }
+.ah { fill: var(--muted); }
+.ah-v { fill: var(--accent); }
+.ah-deny { fill: var(--deny); }
+.el { fill: var(--muted); font: 500 10.5px var(--sans); }
+.el.v { fill: var(--accent); }
+.el.deny { fill: var(--deny); }
+.el.mono { font: 400 10.5px var(--mono); }
+.pill { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+.pill.signed { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.4; }
+.pt { fill: var(--ink); font: 600 12.5px var(--mono); }
+.pt.dim { fill: var(--muted); }
+.st { fill: var(--ink); font: 400 12.5px var(--sans); }
+.st .m { font-family: var(--mono); font-size: 11.5px; }
+.actor { fill: var(--sheet); stroke: var(--ink); stroke-width: 1.1; }
+.at { fill: var(--ink); font: 600 13px var(--sans); }
+.divider { stroke: var(--line); stroke-dasharray: 2 4; }
+
+/* legend */
+.legend { display: flex; flex-wrap: wrap; gap: 10px 28px; margin: 0; padding: 0; list-style: none; font-size: 13px; color: var(--muted); }
+.legend li { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.legend svg { flex: none; }
+.legend b { color: var(--ink); font-weight: 600; }
+.keys { margin: 0; font: 400 12.5px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.keys span { color: var(--ink); }
+
+/* refusals table */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 640px; }
+th, td { text-align: left; vertical-align: top; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+th { font: 600 11px var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+td.fn { font: 400 12.5px var(--mono); color: var(--muted); white-space: nowrap; }
+.chip { display: inline-block; font: 600 11px var(--sans); letter-spacing: 0.03em; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.chip.after { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.aside { max-width: 72ch; margin: 0; font-size: 14px; color: var(--muted); }
+.aside strong { color: var(--ink); }
+
+footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 16px; display: flex; flex-wrap: wrap; gap: 6px 20px; }
+
+@media (max-width: 560px) {
+  main { padding-block: 28px 48px; gap: 40px; }
+  .sheet { padding: 12px; }
+  .lede { font-size: 16px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">valotechllc/Gapline · db/schema.sql · main @ eb5b16f</div>
+    <h1>Gapline Schema</h1>
+    <p class="lede">The PostgreSQL schema behind a NIST SP 800-171 Rev 2 self-assessment. A versioned control library sits on one side and each customer's assessment on the other. These drawings show how the two connect and what changes once a senior official signs.</p>
+    <p class="meta">15 tables · 1 view · tested on PostgreSQL 15–18 · 189 checks in db/tests</p>
+  </header>
+
+  <section aria-labelledby="h-tables">
+    <h2 id="h-tables">Tables and keys</h2>
+    <figure>
+      <div class="sheet scroll">
+        <svg class="dia er" viewBox="0 0 1080 596" role="img" aria-label="Entity diagram. The control library tables are keyed by library version. Each assessment chooses one library version, and every per-assessment row references both the assessment and a library row through keys that include library_version, so all of an assessment's rows use the same version.">
+          <defs>
+            <marker id="er-a" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+            <marker id="er-av" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah-v"/></marker>
+          </defs>
+
+          <!-- band labels -->
+          <text class="band" x="28" y="22">CONTROL LIBRARY</text>
+          <text class="tag frozen" x="300" y="22" text-anchor="end">FROZEN ONCE SIGNED</text>
+          <text class="band" x="430" y="22">PER-ASSESSMENT ROWS</text>
+          <text class="band" x="800" y="22">ASSESSMENTS</text>
+          <rect class="frame" x="28" y="32" width="272" height="550" rx="10"/>
+
+          <!-- library column -->
+          <rect class="box" x="48" y="44" width="232" height="50" rx="6"/>
+          <text class="tn" x="60" y="62">library_version</text>
+          <text class="tk" x="60" y="80">PK id</text>
+          <text class="note" x="60" y="111">every row below carries library_version</text>
+
+          <rect class="box" x="48" y="120" width="232" height="50" rx="6"/>
+          <text class="tn" x="60" y="138">control_family</text>
+          <text class="tk" x="60" y="156">PK (library_version, code)</text>
+
+          <rect class="box" x="48" y="224" width="232" height="68" rx="6"/>
+          <text class="tn" x="60" y="242">requirement</text>
+          <text class="tk" x="60" y="260">PK (library_version, id)</text>
+          <text class="tk" x="60" y="278">FK family_code</text>
+
+          <rect class="box" x="48" y="322" width="232" height="68" rx="6"/>
+          <text class="tn" x="60" y="340">assessment_objective</text>
+          <text class="tk" x="60" y="358">PK (library_version, id)</text>
+          <text class="tk" x="60" y="376">FK requirement_id</text>
+
+          <rect class="box" x="48" y="420" width="232" height="50" rx="6"/>
+          <text class="tn" x="60" y="438">check_rule</text>
+          <text class="tk" x="60" y="456">PK (library_version, id)</text>
+
+          <rect class="box" x="48" y="500" width="232" height="68" rx="6"/>
+          <text class="tn" x="60" y="518">evidence_method</text>
+          <text class="tk" x="60" y="536">PK id</text>
+          <text class="tk" x="60" y="554">FK objective_id, rule_id</text>
+
+          <line class="edge v" x1="164" y1="224" x2="164" y2="171" marker-end="url(#er-av)"/>
+          <line class="edge v" x1="164" y1="322" x2="164" y2="293" marker-end="url(#er-av)"/>
+          <line class="edge v" x1="164" y1="500" x2="164" y2="471" marker-end="url(#er-av)"/>
+          <polyline class="edge v" points="48,534 37,534 37,356 47,356" marker-end="url(#er-av)"/>
+
+          <!-- per-assessment column -->
+          <rect class="box" x="430" y="110" width="270" height="50" rx="6"/>
+          <text class="tn" x="442" y="128">ssp_narrative</text>
+          <text class="tag edit" x="688" y="128" text-anchor="end">EDITABLE</text>
+          <text class="tk" x="442" y="146">PK (assessment_id, requirement_id)</text>
+
+          <rect class="box" x="430" y="172" width="270" height="68" rx="6"/>
+          <text class="tn" x="442" y="190">ssp_snapshot</text>
+          <text class="tag append" x="688" y="190" text-anchor="end">APPEND-ONLY</text>
+          <text class="tk" x="442" y="208">PK (assessment_id, requirement_id)</text>
+          <text class="tk" x="442" y="226">+ final_sha256 per section</text>
+
+          <rect class="box" x="430" y="252" width="270" height="68" rx="6"/>
+          <text class="tn" x="442" y="270">poam_item</text>
+          <text class="tag edit" x="688" y="270" text-anchor="end">EDITABLE</text>
+          <text class="tk" x="442" y="288">PK id</text>
+          <text class="tk" x="442" y="306">FK requirement_id</text>
+
+          <rect class="box" x="430" y="331" width="270" height="50" rx="6"/>
+          <text class="tn" x="442" y="349">objective_result</text>
+          <text class="tag lock" x="688" y="349" text-anchor="end">LOCKED</text>
+          <text class="tk" x="442" y="367">PK (assessment_id, objective_id)</text>
+
+          <rect class="box" x="430" y="399" width="270" height="68" rx="6"/>
+          <text class="tn" x="442" y="417">objective_evidence</text>
+          <text class="tag lock" x="688" y="417" text-anchor="end">LOCKED</text>
+          <text class="tk" x="442" y="435">PK (assessment_id, objective_id,</text>
+          <text class="tk" x="442" y="453">    evidence_id)</text>
+
+          <rect class="box view" x="430" y="485" width="270" height="68" rx="6"/>
+          <text class="tn" x="442" y="503">requirement_status</text>
+          <text class="tag view" x="688" y="503" text-anchor="end">VIEW</text>
+          <text class="tk" x="442" y="521">unreviewed until every objective</text>
+          <text class="tk" x="442" y="539">has a human result</text>
+
+          <!-- per-assessment rows to the library -->
+          <line class="edge v" x1="430" y1="135" x2="360" y2="135"/>
+          <line class="edge v" x1="430" y1="206" x2="360" y2="206"/>
+          <line class="edge v" x1="430" y1="286" x2="360" y2="286"/>
+          <line class="edge v" x1="360" y1="135" x2="360" y2="286"/>
+          <line class="edge v" x1="360" y1="258" x2="281" y2="258" marker-end="url(#er-av)"/>
+          <line class="edge v" x1="430" y1="356" x2="281" y2="356" marker-end="url(#er-av)"/>
+
+          <!-- per-assessment rows to the assessment -->
+          <line class="edge v" x1="700" y1="135" x2="799" y2="135" marker-end="url(#er-av)"/>
+          <line class="edge v" x1="700" y1="206" x2="799" y2="206" marker-end="url(#er-av)"/>
+          <line class="edge v" x1="700" y1="286" x2="799" y2="286" marker-end="url(#er-av)"/>
+          <line class="edge v" x1="700" y1="356" x2="799" y2="356" marker-end="url(#er-av)"/>
+          <line class="edge" x1="565" y1="399" x2="565" y2="382" marker-end="url(#er-a)"/>
+          <line class="edge" x1="700" y1="433" x2="799" y2="433" marker-end="url(#er-a)"/>
+          <text class="el" x="750" y="425" text-anchor="middle">same assessment</text>
+
+          <!-- assessment column -->
+          <rect class="box" x="800" y="44" width="250" height="50" rx="6"/>
+          <text class="tn" x="812" y="62">organization</text>
+          <text class="tk" x="812" y="80">PK id</text>
+
+          <rect class="box hub" x="800" y="110" width="250" height="271" rx="6"/>
+          <text class="tn" x="812" y="128">assessment</text>
+          <text class="tk" x="812" y="146">PK id</text>
+          <text class="tk" x="812" y="164">FK org_id, library_version</text>
+          <text class="tk" x="812" y="182">UNIQUE (id, library_version)</text>
+          <text class="tk" x="812" y="212">status</text>
+          <text class="tk" x="812" y="230">  in_progress · in_review</text>
+          <text class="tk" x="812" y="248">  signed · superseded</text>
+          <text class="tk" x="812" y="266">signed_by, signed_at</text>
+          <text class="note" x="812" y="318">Every per-assessment row</text>
+          <text class="note" x="812" y="334">references (id, library_version),</text>
+          <text class="note" x="812" y="350">so it uses this version.</text>
+
+          <rect class="box" x="800" y="399" width="250" height="68" rx="6"/>
+          <text class="tn" x="812" y="417">evidence_item</text>
+          <text class="tag append" x="1038" y="417" text-anchor="end">APPEND-ONLY</text>
+          <text class="tk" x="812" y="435">PK id</text>
+          <text class="tk" x="812" y="453">UNIQUE (id, assessment_id)</text>
+
+          <rect class="box" x="800" y="485" width="250" height="68" rx="6"/>
+          <text class="tn" x="812" y="503">ssp_snapshot_digest</text>
+          <text class="tag append" x="1038" y="503" text-anchor="end">APPEND-ONLY</text>
+          <text class="tk" x="812" y="521">PK assessment_id</text>
+          <text class="tk" x="812" y="539">sha256 of the whole SSP</text>
+
+          <line class="edge" x1="925" y1="110" x2="925" y2="95" marker-end="url(#er-a)"/>
+          <line class="edge" x1="925" y1="399" x2="925" y2="382" marker-end="url(#er-a)"/>
+          <polyline class="edge" points="1050,519 1066,519 1066,300 1051,300" marker-end="url(#er-a)"/>
+          <polyline class="edge v" points="800,124 760,124 760,69 281,69" marker-end="url(#er-av)"/>
+          <text class="el v" x="520" y="61" text-anchor="middle">each assessment uses one library version</text>
+        </svg>
+      </div>
+      <ul class="legend">
+        <li><svg width="34" height="10" aria-hidden="true"><line class="edge v" x1="0" y1="5" x2="26" y2="5"/><path class="ah-v" d="M26,1 L34,5 L26,9 z"/></svg><span><b>Key includes library_version.</b> The row must use its assessment's version.</span></li>
+        <li><svg width="34" height="10" aria-hidden="true"><line class="edge" x1="0" y1="5" x2="26" y2="5"/><path class="ah" d="M26,1 L34,5 L26,9 z"/></svg><span><b>Other foreign key.</b> Arrows point at the referenced table.</span></li>
+        <li><span><b style="color:var(--deny)">LOCKED</b> can't change once its assessment is signed</span></li>
+        <li><span><b>APPEND-ONLY</b> never updated or deleted</span></li>
+        <li><span><b style="color:var(--ok)">EDITABLE</b> still editable after signing</span></li>
+      </ul>
+      <p class="keys">Example keys in version 1 (DoD Assessment Methodology v1.2.1): family <span>(1, 'IA')</span> · requirement <span>(1, '3.5.3')</span> · objective <span>(1, '3.5.3[a]')</span> · rule <span>(1, 'IA-MFA-ALL-USERS')</span></p>
+      <figcaption><strong>One version per assessment.</strong> Library rows are keyed by <code>(library_version, id)</code>, so a later scoring version can reuse <code>3.5.3</code> with a different weight without touching earlier assessments. Results, SSP sections and POA&amp;M items reference both their assessment and a library row through keys that include <code>library_version</code>, so a v1 assessment can't pick up a v2 objective. <code>clone_library_version()</code> copies a version to start the next one.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="h-signing">
+    <h2 id="h-signing">Signing</h2>
+    <figure>
+      <div class="sheet scroll">
+        <svg class="dia life" viewBox="0 0 1000 300" role="img" aria-label="Assessment lifecycle. An assessment is created unsigned, moves between in_progress and in_review, is signed, and can then only be superseded. Un-signing and superseding an unsigned assessment are rejected. Signing snapshots and hashes the SSP, locks results and freezes the library version in the same transaction.">
+          <defs>
+            <marker id="lc-a" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+            <marker id="lc-av" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah-v"/></marker>
+            <marker id="lc-ad" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah-deny"/></marker>
+          </defs>
+
+          <line class="edge" x1="105" y1="8" x2="105" y2="39" marker-end="url(#lc-a)"/>
+          <text class="el" x="114" y="28">create</text>
+
+          <rect class="box" x="20" y="40" width="330" height="110" rx="10"/>
+          <rect class="pill" x="40" y="62" width="130" height="36" rx="18"/>
+          <text class="pt" x="105" y="85" text-anchor="middle">in_progress</text>
+          <rect class="pill" x="200" y="62" width="130" height="36" rx="18"/>
+          <text class="pt" x="265" y="85" text-anchor="middle">in_review</text>
+          <line class="edge" x1="171" y1="74" x2="199" y2="74" marker-end="url(#lc-a)"/>
+          <line class="edge" x1="199" y1="86" x2="171" y2="86" marker-end="url(#lc-a)"/>
+          <text class="band" x="40" y="132">UNSIGNED · EDITABLE · CAN BE DELETED</text>
+
+          <line class="edge v" x1="350" y1="80" x2="499" y2="80" marker-end="url(#lc-av)"/>
+          <text class="el v" x="424" y="70" text-anchor="middle">sign</text>
+          <text class="el mono" x="424" y="96" text-anchor="middle">signed_by + signed_at</text>
+
+          <rect class="pill signed" x="500" y="62" width="150" height="36" rx="18"/>
+          <text class="pt" x="575" y="85" text-anchor="middle">signed</text>
+
+          <line class="edge" x1="650" y1="80" x2="799" y2="80" marker-end="url(#lc-a)"/>
+          <text class="el" x="724" y="70" text-anchor="middle">supersede</text>
+
+          <rect class="pill" x="800" y="62" width="150" height="36" rx="18"/>
+          <text class="pt dim" x="875" y="85" text-anchor="middle">superseded</text>
+          <text class="el" x="875" y="118" text-anchor="middle">final: no further changes</text>
+
+          <polyline class="edge deny" points="525,98 525,124 351,124" marker-end="url(#lc-ad)"/>
+          <text class="el deny" x="438" y="118" text-anchor="middle">un-sign or edit: rejected</text>
+          <polyline class="edge deny" points="300,40 300,20 875,20 875,61" marker-end="url(#lc-ad)"/>
+          <text class="el deny" x="588" y="14" text-anchor="middle">supersede without signing: rejected</text>
+
+          <line class="edge v" x1="575" y1="98" x2="575" y2="175" marker-end="url(#lc-av)"/>
+          <rect class="box" x="20" y="176" width="960" height="110" rx="10"/>
+          <text class="band" x="40" y="202">AT SIGNING, IN THE SAME TRANSACTION</text>
+          <text class="st" x="40" y="234">The SSP is copied into <tspan class="m">ssp_snapshot</tspan>, each section with a SHA-256.</text>
+          <text class="st" x="40" y="264">One <tspan class="m">ssp_snapshot_digest</tspan> row hashes the whole SSP.</text>
+          <text class="st" x="510" y="234">Results, evidence links and the assessment row lock.</text>
+          <text class="st" x="510" y="264">The library version freezes for every assessment on it.</text>
+        </svg>
+      </div>
+      <figcaption><strong>Signing is a one-way update.</strong> Assessments can't be created signed or superseded, so every signature goes through the snapshot trigger, and <code>superseded</code> always means the assessment was signed. To revise a signed assessment, start a new one and supersede the old. The snapshot is written by the table owner's function only; the app role can't insert into it, even from a trigger of its own.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="h-locks">
+    <h2 id="h-locks">Concurrent edits</h2>
+    <figure>
+      <div class="sheet scroll">
+        <svg class="dia locks" viewBox="0 0 1000 216" role="img" aria-label="Two lock pairs. A result edit takes a share lock on the assessment row, which conflicts with the row lock taken by signing. A library edit takes a no-key-update lock on the library_version row, which conflicts with the share lock taken by signing. In each pair the later operation waits for the earlier one to commit.">
+          <defs>
+            <marker id="lk-a" viewBox="0 0 10 10" refX="10" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ah"/></marker>
+          </defs>
+          <line class="divider" x1="500" y1="4" x2="500" y2="210"/>
+
+          <g>
+            <text class="band" x="10" y="16">RESULT EDITS VS SIGNING</text>
+            <rect class="box hub" x="155" y="40" width="180" height="44" rx="6"/>
+            <text class="tn" x="245" y="67" text-anchor="middle">assessment row</text>
+            <rect class="actor" x="10" y="160" width="170" height="44" rx="22"/>
+            <text class="at" x="95" y="187" text-anchor="middle">Result edit</text>
+            <rect class="actor" x="310" y="160" width="170" height="44" rx="22"/>
+            <text class="at" x="395" y="187" text-anchor="middle">Signing</text>
+            <line class="edge" x1="95" y1="159" x2="212" y2="86" marker-end="url(#lk-a)"/>
+            <line class="edge" x1="395" y1="159" x2="278" y2="86" marker-end="url(#lk-a)"/>
+            <text class="el mono" x="144" y="116" text-anchor="end">FOR SHARE</text>
+            <text class="el mono" x="346" y="116">row lock (UPDATE)</text>
+            <text class="el deny" x="245" y="126" text-anchor="middle">conflict</text>
+          </g>
+
+          <g transform="translate(510 0)">
+            <text class="band" x="10" y="16">LIBRARY EDITS VS SIGNING</text>
+            <rect class="box hub" x="155" y="40" width="180" height="44" rx="6"/>
+            <text class="tn" x="245" y="67" text-anchor="middle">library_version row</text>
+            <rect class="actor" x="10" y="160" width="170" height="44" rx="22"/>
+            <text class="at" x="95" y="187" text-anchor="middle">Library edit</text>
+            <rect class="actor" x="310" y="160" width="170" height="44" rx="22"/>
+            <text class="at" x="395" y="187" text-anchor="middle">Signing</text>
+            <line class="edge" x1="95" y1="159" x2="212" y2="86" marker-end="url(#lk-a)"/>
+            <line class="edge" x1="395" y1="159" x2="278" y2="86" marker-end="url(#lk-a)"/>
+            <text class="el mono" x="144" y="116" text-anchor="end">FOR NO KEY UPDATE</text>
+            <text class="el mono" x="346" y="116">FOR SHARE</text>
+            <text class="el deny" x="245" y="126" text-anchor="middle">conflict</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption><strong>The later one waits, then sees the earlier one's commit.</strong> An edit that started first holds up the signing until it commits, so it lands before the signature. An edit that arrives during a signing waits, then gets rejected because the assessment or version is now locked. Two result edits on an unsigned assessment share the lock and don't wait for each other. These guarantees assume READ COMMITTED, PostgreSQL's default. <code>db/tests/09_signing_concurrency.sql</code> drives both orders with two live sessions.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="h-refuse">
+    <h2 id="h-refuse">What the database refuses</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th scope="col">Attempt</th><th scope="col">When</th><th scope="col">Guard</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Create an assessment that is already signed or superseded</td><td><span class="chip">always</span></td><td class="fn">guard_signed_assessment</td></tr>
+          <tr><td>Supersede an assessment that was never signed</td><td><span class="chip">always</span></td><td class="fn">guard_signed_assessment</td></tr>
+          <tr><td>Un-sign, edit or delete a signed assessment; change a superseded one</td><td><span class="chip after">after signing</span></td><td class="fn">guard_signed_assessment</td></tr>
+          <tr><td>Add, change or remove results or evidence links</td><td><span class="chip after">after signing</span></td><td class="fn">reject_change_if_signed</td></tr>
+          <tr><td>Insert, update or delete any family, requirement, objective, rule, evidence method or the version row itself</td><td><span class="chip after">version signed</span></td><td class="fn">reject_frozen_library_change</td></tr>
+          <tr><td>Update, delete or truncate evidence</td><td><span class="chip">always</span></td><td class="fn">reject_append_only_change</td></tr>
+          <tr><td>Write snapshot or digest rows any way other than signing</td><td><span class="chip">always</span></td><td class="fn">reject_direct_snapshot_insert</td></tr>
+          <tr><td>Update, delete or truncate snapshot or digest rows</td><td><span class="chip">always</span></td><td class="fn">reject_append_only_change</td></tr>
+          <tr><td>TRUNCATE library, result or assessment tables</td><td><span class="chip after">anything signed</span></td><td class="fn">reject_truncate_if_signed</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="aside"><strong>Still editable after signing:</strong> <code>ssp_narrative</code>, the living SSP, and <code>poam_item</code>, so remediation can be tracked to close-out. <strong>Not a guard against the owner:</strong> every rule here is a trigger, and a role that owns the tables can disable triggers, so the app has to connect as a non-owner role.</p>
+  </section>
+
+  <section aria-labelledby="h-score">
+    <h2 id="h-score">Scoring</h2>
+    <p class="prose"><code>requirement_status</code> starts from the library rather than from the results, so a requirement stays <code>unreviewed</code> until every one of its objectives has a human result, and it is <code>met</code> only when all of them are met or not applicable. AI and rule results are kept beside the human one and never score. The SPRS figure itself (110 minus deductions, as low as −203) is left to application code, which isn't written yet. The schema notes the rule it must follow: no score while any requirement is unreviewed or 3.12.4 is not met.</p>
+  </section>
+
+  <footer>
+    <span>Source: <a href="https://github.com/valotechllc/Gapline/blob/main/db/schema.sql" target="_blank" rel="noopener">db/schema.sql</a></span>
+    <span>Tests: <a href="https://github.com/valotechllc/Gapline/tree/main/db/tests" target="_blank" rel="noopener">db/tests</a></span>
+    <span>Change history: <a href="https://github.com/valotechllc/Gapline/pull/1" target="_blank" rel="noopener">pull request #1</a></span>
+  </footer>
+</main>
+</body>
+</html>
