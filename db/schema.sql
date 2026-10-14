@@ -192,6 +192,26 @@ CREATE TRIGGER check_rule_no_truncate BEFORE TRUNCATE ON check_rule
 CREATE TRIGGER evidence_method_no_truncate BEFORE TRUNCATE ON evidence_method
     FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 
+-- control_family isn't versioned, so it freezes per row: a family can't be renamed, re-coded
+-- or deleted once a requirement in a frozen version belongs to it. New families can always be
+-- added, and families used only by unfrozen versions stay editable.
+CREATE FUNCTION reject_frozen_family_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM requirement r
+               JOIN assessment a ON a.library_version = r.library_version
+               WHERE a.status IN ('signed','superseded')
+                 AND r.family_code = OLD.code) THEN
+        RAISE EXCEPTION '% on control_family % rejected: used by a library version frozen by a signed or superseded assessment',
+            TG_OP, OLD.code;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+CREATE TRIGGER control_family_freeze BEFORE UPDATE OR DELETE ON control_family
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_family_change();
+CREATE TRIGGER control_family_no_truncate BEFORE TRUNCATE ON control_family
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+
 -- Raw evidence, immutable. Hash it so you can prove what you saw and when.
 -- Hash the raw bytes as received and keep those bytes at file_uri. Don't hash payload:
 -- JSONB reorders keys, strips whitespace and drops duplicate keys, so the stored payload
