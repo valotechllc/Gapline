@@ -1,4 +1,4 @@
--- NIST 800-171 Rev 2 Assessment Tool — Control Library & Assessment Schema (PostgreSQL)
+-- NIST 800-171 Rev 2 Assessment Tool — Control Library & Assessment Schema (PostgreSQL 13+; tested on 16)
 -- Design rule: the LIBRARY tables are static reference data you own and version.
 -- The ASSESSMENT tables are per-customer. The LLM never writes scores directly.
 
@@ -15,52 +15,75 @@ CREATE TABLE library_version (
     notes           TEXT
 );
 
+-- Library rows (families, requirements, objectives, check rules) are keyed by
+-- (library_version, id), so a new version can reuse the Rev 2 IDs ('3.5.3', 'IA') with different
+-- weights, names or text and sit beside the old one. Every table that points at a library row
+-- carries library_version too. To start a new version from an existing one, use
+-- clone_library_version() in clone_library_version.sql.
 CREATE TABLE control_family (
-    code            TEXT PRIMARY KEY,        -- 'AC', 'IA', 'SC' ...
-    name            TEXT NOT NULL            -- 'Access Control'
+    code            TEXT NOT NULL,           -- 'AC', 'IA', 'SC' ...
+    library_version INT  NOT NULL REFERENCES library_version(id),
+    name            TEXT NOT NULL,           -- 'Access Control'
+    PRIMARY KEY (library_version, code)
 );
 
 CREATE TABLE requirement (
-    id              TEXT PRIMARY KEY,        -- '3.5.3'
+    id              TEXT NOT NULL,           -- '3.5.3'
     library_version INT  NOT NULL REFERENCES library_version(id),
-    family_code     TEXT NOT NULL REFERENCES control_family(code),
+    family_code     TEXT NOT NULL,           -- family in the same library_version
     req_type        TEXT NOT NULL CHECK (req_type IN ('basic','derived')),
     title           TEXT NOT NULL,
     statement       TEXT NOT NULL,           -- official requirement text
     plain_english   TEXT,                    -- your rewrite for the interview UI
-    sprs_weight     SMALLINT NOT NULL CHECK (sprs_weight IN (1,3,5)),
+    sprs_weight     SMALLINT,                -- 1, 3 or 5. May be NULL only where blocks_scoring (3.12.4),
+                                             -- whose failure voids the score instead of deducting points
     partial_rule    JSONB,                   -- partial-credit logic, e.g. 3.5.3, 3.13.11 (see seed below)
-    poam_eligible   BOOLEAN NOT NULL,        -- can it sit on a POA&M under the CMMC rule?
-    blocks_scoring  BOOLEAN NOT NULL DEFAULT FALSE  -- 3.12.4: no SSP = no valid score at all
+    poam_eligible   BOOLEAN NOT NULL,        -- can it sit on a POA&M under the CMMC rule? (necessary, not
+                                             -- sufficient: see POA&M note in section 3)
+    blocks_scoring  BOOLEAN NOT NULL DEFAULT FALSE,  -- 3.12.4: no SSP = no valid score at all
+    PRIMARY KEY (library_version, id),
+    FOREIGN KEY (library_version, family_code) REFERENCES control_family(library_version, code),
+    CHECK ((sprs_weight IS NOT NULL AND sprs_weight IN (1,3,5))
+        OR (sprs_weight IS NULL AND blocks_scoring))
 );
 
 CREATE TABLE assessment_objective (
-    id              TEXT PRIMARY KEY,        -- '3.5.3[a]' (from 800-171A; 320 total)
-    requirement_id  TEXT NOT NULL REFERENCES requirement(id),
+    id              TEXT NOT NULL,           -- '3.5.3[a]' (from 800-171A; 320 total)
+    library_version INT  NOT NULL,
+    requirement_id  TEXT NOT NULL,
     letter          TEXT NOT NULL,           -- 'a','b','c'...
     text            TEXT NOT NULL,
-    odp             BOOLEAN NOT NULL DEFAULT FALSE  -- needs an org-defined parameter?
+    odp             BOOLEAN NOT NULL DEFAULT FALSE,  -- needs an org-defined parameter?
+    PRIMARY KEY (library_version, id),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
 
 -- Deterministic checks. Code decides these, not the model.
+-- Versioned like requirements: to change a rule's logic, add it under a new library_version
+-- rather than editing it, so re-running an old assessment still evaluates the way it did.
 CREATE TABLE check_rule (
-    id              TEXT PRIMARY KEY,        -- 'IA-MFA-ALL-USERS'
+    id              TEXT NOT NULL,           -- 'IA-MFA-ALL-USERS'
+    library_version INT  NOT NULL REFERENCES library_version(id),
     description     TEXT NOT NULL,
-    source          TEXT NOT NULL,           -- 'graph', 'exo_powershell', 'intune'
+    source          TEXT NOT NULL,           -- 'graph', 'exo_powershell', 'scc_powershell', 'intune'
     logic           JSONB NOT NULL,          -- declarative condition evaluated by your engine
-    license_needed  TEXT                     -- 'Entra ID P1' etc. — flag when missing, don't fail silently
+    license_needed  TEXT,                    -- 'Entra ID P1' etc. — flag when missing, don't fail silently
+    PRIMARY KEY (library_version, id)
 );
 
 -- How each objective CAN be evidenced. One objective -> many methods.
 CREATE TABLE evidence_method (
     id              SERIAL PRIMARY KEY,
-    objective_id    TEXT NOT NULL REFERENCES assessment_objective(id),
+    library_version INT  NOT NULL,
+    objective_id    TEXT NOT NULL,
     method_type     TEXT NOT NULL CHECK (method_type IN
                         ('automated_check','interview','document','screenshot','attestation')),
     collector       TEXT,                    -- 'graph.conditional_access', 'exo.mailbox_audit', NULL for manual
-    rule_id         TEXT REFERENCES check_rule(id),   -- deterministic rule, if automated
+    rule_id         TEXT,                    -- deterministic rule, if automated (same library_version)
     interview_prompt TEXT,                   -- question asked when no automated source exists
-    assessor_guidance TEXT                   -- what an assessor would want to see
+    assessor_guidance TEXT,                  -- what an assessor would want to see
+    FOREIGN KEY (library_version, objective_id) REFERENCES assessment_objective(library_version, id),
+    FOREIGN KEY (library_version, rule_id) REFERENCES check_rule(library_version, id)
 );
 
 -- =========================================================
@@ -86,25 +109,149 @@ CREATE TABLE assessment (
                         CHECK (status IN ('in_progress','in_review','signed','superseded')),
     signed_by       TEXT,                    -- the human who attests (senior official for SPRS)
     signed_at       TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (status <> 'signed' OR (signed_by IS NOT NULL AND signed_at IS NOT NULL)),
+    -- Target for the composite FKs below: results, SSP text and POA&M items must use library rows
+    -- from this assessment's version. It also blocks changing library_version once any exist.
+    UNIQUE (id, library_version)
 );
 
+-- A signed assessment can't be un-signed or edited (that would lift every lock below and
+-- rewrite the attestation). Its only allowed change is signed -> superseded, with every other
+-- column unchanged; superseded is final. Neither can be deleted. No-op updates pass.
+-- Assessments can't be created signed or superseded, and only a signed assessment can be
+-- superseded: signing must be an update, so the SSP snapshot trigger (see ssp_snapshot) runs
+-- for every signed assessment, and 'superseded' always means "was signed".
+--
+-- Signing also takes a SHARE lock on the assessment's library_version row. Library edits lock
+-- that row too (reject_frozen_library_change), so an edit and a signing on the same version
+-- can't overlap: the later one waits for the earlier to commit, then sees it.
+-- The concurrency guards here assume READ COMMITTED, PostgreSQL's default. Under REPEATABLE
+-- READ the result locks still fail safe (serialization error), but a library edit whose
+-- snapshot predates a concurrent signing is not caught.
+CREATE FUNCTION guard_signed_assessment() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status IN ('signed', 'superseded') THEN
+            RAISE EXCEPTION 'insert on assessment rejected: create it unsigned, then sign it by update';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' AND to_jsonb(NEW) = to_jsonb(OLD) THEN
+        RETURN NEW;
+    END IF;
+    IF OLD.status = 'superseded'
+       OR (OLD.status = 'signed' AND (TG_OP = 'DELETE'
+                                      OR NEW.status <> 'superseded'
+                                      OR to_jsonb(NEW) - 'status' <> to_jsonb(OLD) - 'status')) THEN
+        RAISE EXCEPTION '% on assessment % rejected: it is %; the only allowed change is signed -> superseded',
+            TG_OP, OLD.id, OLD.status;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.status = 'superseded' AND OLD.status <> 'signed' THEN
+        RAISE EXCEPTION 'update on assessment % rejected: only a signed assessment can be superseded', OLD.id;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.status = 'signed' AND OLD.status <> 'signed' THEN
+        PERFORM 1 FROM library_version WHERE id = NEW.library_version FOR SHARE;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+CREATE TRIGGER assessment_signed_guard BEFORE INSERT OR UPDATE OR DELETE ON assessment
+    FOR EACH ROW EXECUTE FUNCTION guard_signed_assessment();
+
+-- Freeze a library version once any assessment on it is signed or superseded: no inserts,
+-- updates or deletes of its families, requirements, objectives, rules or evidence methods, or
+-- of the library_version row itself. A signed assessment's scoring view and rule logic are read live
+-- from these rows, so editing them would change what was attested. Fix mistakes in a new version.
+-- Like the other guards, this only binds roles that don't own the tables.
+CREATE FUNCTION reject_frozen_library_change() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+    col      TEXT := COALESCE(TG_ARGV[0], 'library_version');  -- library_version's own key is 'id'
+    versions INT[] := ARRAY[CASE WHEN TG_OP <> 'INSERT' THEN (to_jsonb(OLD) ->> col)::int END,
+                            CASE WHEN TG_OP <> 'DELETE' THEN (to_jsonb(NEW) ->> col)::int END];
+BEGIN
+    -- Conflicts with the SHARE lock a signing takes (guard_signed_assessment): wait for an
+    -- in-flight signing to commit and then see it, or make a new signing wait for this edit.
+    PERFORM 1 FROM library_version WHERE id = ANY (versions) ORDER BY id FOR NO KEY UPDATE;
+    IF EXISTS (SELECT 1 FROM assessment
+               WHERE status IN ('signed','superseded')
+                 AND library_version = ANY (versions)) THEN
+        RAISE EXCEPTION '% on % rejected: library version is frozen by a signed or superseded assessment',
+            TG_OP, TG_TABLE_NAME;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+-- TRUNCATE skips row triggers (and TRUNCATE ... CASCADE reaches the result tables), so the
+-- library, result and assessment tables refuse it outright once anything is signed.
+CREATE FUNCTION reject_truncate_if_signed() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM assessment WHERE status IN ('signed','superseded')) THEN
+        RAISE EXCEPTION 'TRUNCATE on % rejected: signed or superseded assessments exist', TG_TABLE_NAME;
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE TRIGGER library_version_freeze BEFORE INSERT OR UPDATE OR DELETE ON library_version
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change('id');
+CREATE TRIGGER control_family_freeze BEFORE INSERT OR UPDATE OR DELETE ON control_family
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+CREATE TRIGGER requirement_freeze BEFORE INSERT OR UPDATE OR DELETE ON requirement
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+CREATE TRIGGER assessment_objective_freeze BEFORE INSERT OR UPDATE OR DELETE ON assessment_objective
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+CREATE TRIGGER check_rule_freeze BEFORE INSERT OR UPDATE OR DELETE ON check_rule
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+CREATE TRIGGER evidence_method_freeze BEFORE INSERT OR UPDATE OR DELETE ON evidence_method
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+
+CREATE TRIGGER library_version_no_truncate BEFORE TRUNCATE ON library_version
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER control_family_no_truncate BEFORE TRUNCATE ON control_family
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER requirement_no_truncate BEFORE TRUNCATE ON requirement
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER assessment_objective_no_truncate BEFORE TRUNCATE ON assessment_objective
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER check_rule_no_truncate BEFORE TRUNCATE ON check_rule
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER evidence_method_no_truncate BEFORE TRUNCATE ON evidence_method
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+
 -- Raw evidence, immutable. Hash it so you can prove what you saw and when.
+-- Hash the raw bytes as received and keep those bytes at file_uri. Don't hash payload:
+-- JSONB reorders keys, strips whitespace and drops duplicate keys, so the stored payload
+-- will not reproduce the hash of what the API actually returned.
 CREATE TABLE evidence_item (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    source          TEXT NOT NULL,           -- 'graph', 'upload', 'interview'
+    source          TEXT NOT NULL,           -- 'graph', 'exo_powershell', 'upload', 'interview'
     collector       TEXT,
-    payload         JSONB,                   -- raw API response or interview answer
-    file_uri        TEXT,                    -- for uploads (object storage, not the DB)
-    sha256          TEXT NOT NULL,
-    collected_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    payload         JSONB,                   -- parsed copy for querying; not the evidence of record
+    file_uri        TEXT,                    -- raw bytes in object storage (API responses and uploads)
+    sha256          TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),  -- of file_uri bytes; of payload::text for interviews
+    collected_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (file_uri IS NOT NULL OR (source = 'interview' AND payload IS NOT NULL)),
+    UNIQUE (id, assessment_id)               -- lets objective_evidence pin evidence to its own assessment
 );
+
+-- Enforce "immutable". This only stops the application role: whoever owns the table can
+-- drop the trigger, so the app must not connect as the table owner.
+CREATE FUNCTION reject_append_only_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only (% rejected)', TG_TABLE_NAME, TG_OP;
+END $$;
+
+CREATE TRIGGER evidence_item_no_update_delete BEFORE UPDATE OR DELETE ON evidence_item
+    FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
+CREATE TRIGGER evidence_item_no_truncate BEFORE TRUNCATE ON evidence_item
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
 
 -- One row per objective per assessment. Three separate opinions, kept apart on purpose.
 CREATE TABLE objective_result (
-    assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    objective_id    TEXT NOT NULL REFERENCES assessment_objective(id),
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,           -- filled from the assessment if omitted; must match it (FK)
+    objective_id    TEXT NOT NULL,
     rule_result     TEXT CHECK (rule_result IN ('met','not_met','unknown')),  -- deterministic
     ai_result       TEXT CHECK (ai_result   IN ('met','not_met','insufficient_evidence')),
     ai_rationale    TEXT,
@@ -112,69 +259,267 @@ CREATE TABLE objective_result (
     human_result    TEXT CHECK (human_result IN ('met','not_met','not_applicable')),
     reviewer        TEXT,
     reviewed_at     TIMESTAMPTZ,
-    PRIMARY KEY (assessment_id, objective_id)
+    PRIMARY KEY (assessment_id, objective_id),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, objective_id) REFERENCES assessment_objective(library_version, id),
+    CHECK (human_result IS NULL OR (reviewer IS NOT NULL AND reviewed_at IS NOT NULL)),
+    CHECK (ai_result IS NULL OR ai_model IS NOT NULL)
 );
 
 CREATE TABLE objective_evidence (            -- which evidence supports which objective
     assessment_id   UUID NOT NULL,
     objective_id    TEXT NOT NULL,
-    evidence_id     UUID NOT NULL REFERENCES evidence_item(id),
+    evidence_id     UUID NOT NULL,
     PRIMARY KEY (assessment_id, objective_id, evidence_id),
-    FOREIGN KEY (assessment_id, objective_id) REFERENCES objective_result(assessment_id, objective_id)
+    FOREIGN KEY (assessment_id, objective_id) REFERENCES objective_result(assessment_id, objective_id),
+    -- Same assessment_id on both sides, so one customer's evidence can't back another's objective.
+    FOREIGN KEY (evidence_id, assessment_id) REFERENCES evidence_item(id, assessment_id)
 );
 
+-- Once an assessment is signed, the results it attests to can't change underneath the signature.
+-- To revise, start a new assessment and mark the old one 'superseded'.
+-- The SHARE lock on the assessment row conflicts with the UPDATE that signs it: an edit waits
+-- for an in-flight signing to commit and then sees it, and a signing waits for open edits.
+-- Concurrent edits to an unsigned assessment don't block each other.
+CREATE FUNCTION reject_change_if_signed() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+    ids UUID[] := ARRAY[CASE WHEN TG_OP <> 'INSERT' THEN OLD.assessment_id END,
+                        CASE WHEN TG_OP <> 'DELETE' THEN NEW.assessment_id END];
+BEGIN
+    PERFORM 1 FROM assessment WHERE id = ANY (ids) ORDER BY id FOR SHARE;
+    IF EXISTS (SELECT 1 FROM assessment
+               WHERE status IN ('signed','superseded')
+                 AND id = ANY (ids)) THEN
+        RAISE EXCEPTION '% on % rejected: assessment is signed or superseded', TG_OP, TG_TABLE_NAME;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+CREATE TRIGGER objective_result_lock BEFORE INSERT OR UPDATE OR DELETE ON objective_result
+    FOR EACH ROW EXECUTE FUNCTION reject_change_if_signed();
+CREATE TRIGGER objective_evidence_lock BEFORE INSERT OR UPDATE OR DELETE ON objective_evidence
+    FOR EACH ROW EXECUTE FUNCTION reject_change_if_signed();
+
+CREATE TRIGGER objective_result_no_truncate BEFORE TRUNCATE ON objective_result
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER objective_evidence_no_truncate BEFORE TRUNCATE ON objective_evidence
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER assessment_no_truncate BEFORE TRUNCATE ON assessment
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+
 -- SSP narrative per requirement (AI drafts, human edits).
+-- The living document: stays editable after signing. What was signed is in ssp_snapshot.
 CREATE TABLE ssp_narrative (
-    assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    requirement_id  TEXT NOT NULL REFERENCES requirement(id),
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,           -- filled from the assessment if omitted; must match it (FK)
+    requirement_id  TEXT NOT NULL,
     draft_text      TEXT,
     final_text      TEXT,
     edited_by       TEXT,
-    PRIMARY KEY (assessment_id, requirement_id)
+    PRIMARY KEY (assessment_id, requirement_id),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
+
+-- The SSP exactly as it stood when the assessment was signed: one row per ssp_narrative row,
+-- copied by trigger in the same transaction as the signing. Append-only, and only that
+-- trigger may write it.
+CREATE TABLE ssp_snapshot (
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,
+    requirement_id  TEXT NOT NULL,
+    draft_text      TEXT,
+    final_text      TEXT,
+    final_sha256    TEXT CHECK (final_sha256 ~ '^[0-9a-f]{64}$'),  -- of final_text as UTF-8; NULL if no final_text
+    edited_by       TEXT,
+    snapshot_at     TIMESTAMPTZ NOT NULL DEFAULT now(),  -- transaction time of the signing
+    PRIMARY KEY (assessment_id, requirement_id),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id),
+    CHECK ((final_text IS NULL) = (final_sha256 IS NULL))
+);
+
+-- One row per signed assessment, written with its snapshot: a single hash for the whole SSP,
+-- to print on an exported copy. A signed assessment with section_count 0 had no SSP sections;
+-- a signed assessment with no row here means the snapshot trigger didn't run.
+--
+-- sha256 is the SHA-256 (lowercase hex) of this manifest, encoded as UTF-8:
+--     one line per ssp_snapshot row, ordered by requirement_id in byte order (COLLATE "C"),
+--     each line: requirement_id, TAB, final_sha256 (or '-' if no final_text), LF.
+-- An empty SSP is the empty string. Only final_text is covered; drafts and editors are not.
+-- To verify an export: hash each section's final text, rebuild the manifest, compare.
+CREATE TABLE ssp_snapshot_digest (
+    assessment_id   UUID PRIMARY KEY REFERENCES assessment(id),
+    section_count   INT  NOT NULL,
+    sha256          TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    snapshot_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Runs as the owner (SECURITY DEFINER), so the app role needs no INSERT privilege on the
+-- snapshot tables, and only works as a trigger on assessment.
+CREATE FUNCTION snapshot_ssp_on_sign() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    IF TG_RELID <> 'assessment'::regclass THEN
+        RAISE EXCEPTION 'snapshot_ssp_on_sign must be a trigger on assessment';
+    END IF;
+    INSERT INTO ssp_snapshot (assessment_id, library_version, requirement_id,
+                              draft_text, final_text, final_sha256, edited_by)
+    SELECT assessment_id, library_version, requirement_id, draft_text, final_text,
+           encode(sha256(convert_to(final_text, 'UTF8')), 'hex'), edited_by
+    FROM ssp_narrative
+    WHERE assessment_id = NEW.id;
+
+    INSERT INTO ssp_snapshot_digest (assessment_id, section_count, sha256)
+    SELECT NEW.id,
+           count(*),
+           encode(sha256(convert_to(coalesce(
+               string_agg(requirement_id || E'\t' || coalesce(final_sha256, '-') || E'\n', ''
+                          ORDER BY requirement_id COLLATE "C"),
+               ''), 'UTF8')), 'hex')
+    FROM ssp_snapshot
+    WHERE assessment_id = NEW.id;
+    RETURN NULL;
+END $$;
+
+-- AFTER, so it only runs once the signing has passed the guard and the CHECK constraints.
+-- The guard makes 'signed' reachable once per assessment, so this fires at most once.
+CREATE TRIGGER assessment_ssp_snapshot AFTER UPDATE ON assessment
+    FOR EACH ROW WHEN (OLD.status <> 'signed' AND NEW.status = 'signed')
+    EXECUTE FUNCTION snapshot_ssp_on_sign();
+
+-- Rows may only come from snapshot_ssp_on_sign, which writes as the table owner from inside a
+-- trigger. Any other role is refused even with INSERT privilege, including from a trigger of
+-- its own; a direct INSERT (trigger depth 1) is refused even for the owner.
+CREATE FUNCTION reject_direct_snapshot_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF pg_trigger_depth() < 2
+       OR current_user <> (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = TG_RELID) THEN
+        RAISE EXCEPTION '% is written only by signing an assessment', TG_TABLE_NAME;
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER ssp_snapshot_insert_guard BEFORE INSERT ON ssp_snapshot
+    FOR EACH ROW EXECUTE FUNCTION reject_direct_snapshot_insert();
+CREATE TRIGGER ssp_snapshot_no_update_delete BEFORE UPDATE OR DELETE ON ssp_snapshot
+    FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
+CREATE TRIGGER ssp_snapshot_no_truncate BEFORE TRUNCATE ON ssp_snapshot
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
+
+CREATE TRIGGER ssp_snapshot_digest_insert_guard BEFORE INSERT ON ssp_snapshot_digest
+    FOR EACH ROW EXECUTE FUNCTION reject_direct_snapshot_insert();
+CREATE TRIGGER ssp_snapshot_digest_no_update_delete BEFORE UPDATE OR DELETE ON ssp_snapshot_digest
+    FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
+CREATE TRIGGER ssp_snapshot_digest_no_truncate BEFORE TRUNCATE ON ssp_snapshot_digest
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
+
+-- The SECURITY DEFINER functions run with the owner's rights: to take row locks the app role
+-- couldn't (FOR SHARE needs UPDATE privilege) and to write snapshots it can't. Pin their
+-- search_path to this schema with pg_temp last, so a caller's temp tables can't stand in for
+-- ours, and take EXECUTE away from PUBLIC so nobody can attach them to other tables. (Triggers
+-- don't check EXECUTE when they fire, so the triggers above keep working for every role.)
+DO $$
+DECLARE
+    fn TEXT;
+BEGIN
+    FOREACH fn IN ARRAY ARRAY['guard_signed_assessment()', 'reject_frozen_library_change()',
+                              'reject_change_if_signed()', 'snapshot_ssp_on_sign()'] LOOP
+        EXECUTE format('ALTER FUNCTION %s SET search_path = %I, pg_temp', fn, current_schema());
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', fn);
+    END LOOP;
+END $$;
 
 CREATE TABLE poam_item (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    requirement_id  TEXT NOT NULL REFERENCES requirement(id),
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,           -- filled from the assessment if omitted; must match it (FK)
+    requirement_id  TEXT NOT NULL,
     weakness        TEXT NOT NULL,
     remediation     TEXT NOT NULL,
     est_cost_usd    NUMERIC(10,2),
     points_recovered SMALLINT,               -- drives the "fix this first" ranking
     owner           TEXT,
     due_date        DATE,
-    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','in_progress','closed'))
+    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','in_progress','closed')),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
+
+-- Callers may omit library_version: copy it from the assessment. An explicit value is kept
+-- as given, so a wrong one still fails the FK instead of being silently corrected.
+-- (BEFORE triggers run ahead of the NOT NULL check, so the column can stay NOT NULL.)
+CREATE FUNCTION fill_library_version() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.library_version IS NULL THEN
+        SELECT library_version INTO NEW.library_version FROM assessment WHERE id = NEW.assessment_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'insert on %: assessment % does not exist', TG_TABLE_NAME, NEW.assessment_id
+                USING ERRCODE = 'foreign_key_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER objective_result_fill_version BEFORE INSERT ON objective_result
+    FOR EACH ROW EXECUTE FUNCTION fill_library_version();
+CREATE TRIGGER ssp_narrative_fill_version BEFORE INSERT ON ssp_narrative
+    FOR EACH ROW EXECUTE FUNCTION fill_library_version();
+CREATE TRIGGER poam_item_fill_version BEFORE INSERT ON poam_item
+    FOR EACH ROW EXECUTE FUNCTION fill_library_version();
 
 -- =========================================================
 -- 3. SCORING — derived only from HUMAN results
 -- =========================================================
 -- A requirement is MET only if every one of its objectives is met (or N/A).
+-- Driven from the library, not from objective_result: an objective with no result row,
+-- or a requirement with no rows at all, must come out 'unreviewed' rather than vanish
+-- (a vanished requirement means a missed deduction and an inflated score).
 CREATE VIEW requirement_status AS
 SELECT
-    o.assessment_id,
+    a.id AS assessment_id,
+    a.library_version,
     r.id AS requirement_id,
     r.sprs_weight,
     r.partial_rule,
+    r.blocks_scoring,
+    count(ao.id)          AS objectives_total,
+    count(o.human_result) AS objectives_reviewed,
     CASE
-        WHEN bool_and(o.human_result IS NOT NULL) IS NOT TRUE THEN 'unreviewed'
+        -- No objectives loaded for this requirement is a library seeding error; fail closed.
+        WHEN count(ao.id) = 0 THEN 'unreviewed'
+        WHEN count(o.human_result) < count(ao.id) THEN 'unreviewed'
         WHEN bool_and(o.human_result IN ('met','not_applicable')) THEN 'met'
         ELSE 'not_met'
     END AS status
-FROM objective_result o
-JOIN assessment_objective ao ON ao.id = o.objective_id
-JOIN requirement r ON r.id = ao.requirement_id
-GROUP BY o.assessment_id, r.id, r.sprs_weight, r.partial_rule;
+FROM assessment a
+JOIN requirement r                ON r.library_version = a.library_version
+LEFT JOIN assessment_objective ao ON ao.library_version = r.library_version AND ao.requirement_id = r.id
+LEFT JOIN objective_result o      ON o.assessment_id = a.id
+                                 AND o.library_version = ao.library_version AND o.objective_id = ao.id
+GROUP BY a.id, r.library_version, r.id;
 
 -- Final SPRS math (110 minus deductions, floor -203) lives in application code,
 -- where partial_rule can be evaluated and unit-tested against known examples.
 -- Refuse to output a score if any requirement is 'unreviewed' or 3.12.4 is not met.
+--
+-- POA&M eligibility is not a per-requirement fact, so poam_eligible alone can't decide it.
+-- As commonly summarized from 32 CFR 170.21 (verify against the eCFR text before relying on it):
+--   * the assessment score must be at least 80% of the maximum (88/110);
+--   * only 1-point requirements, plus 3.13.11 when the deduction is the partial (-3,
+--     encryption used but not FIPS-validated) one;
+--   * never 3.1.20, 3.1.22, 3.12.4, 3.10.3, 3.10.4, 3.10.5, even though most are 1-pointers;
+--   * close-out within 180 days.
 
 -- =========================================================
 -- 4. EXAMPLE SEED ROWS
 -- =========================================================
-INSERT INTO control_family VALUES ('IA','Identification and Authentication'),
-                                  ('SC','System and Communications Protection');
+INSERT INTO library_version (framework, revision, methodology, effective_date)
+VALUES ('NIST SP 800-171', 'Rev 2', 'DoD Assessment Methodology v1.2.1', '2020-06-24');  -- verify date
+
+INSERT INTO control_family (code, library_version, name)
+SELECT f.code, currval('library_version_id_seq'), f.name
+FROM (VALUES ('IA','Identification and Authentication'),
+             ('SC','System and Communications Protection')) AS f(code, name);
 
 -- 3.5.3: -5 if no MFA; -3 if MFA for remote + privileged but not all network access
 -- 3.13.11: -5 if no encryption on CUI; -3 if encryption used but not FIPS-validated
