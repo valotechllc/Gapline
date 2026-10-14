@@ -18,7 +18,8 @@ CREATE TABLE library_version (
 -- Library rows (families, requirements, objectives, check rules) are keyed by
 -- (library_version, id), so a new version can reuse the Rev 2 IDs ('3.5.3', 'IA') with different
 -- weights, names or text and sit beside the old one. Every table that points at a library row
--- carries library_version too.
+-- carries library_version too. To start a new version from an existing one, use
+-- clone_library_version() in clone_library_version.sql.
 CREATE TABLE control_family (
     code            TEXT NOT NULL,           -- 'AC', 'IA', 'SC' ...
     library_version INT  NOT NULL REFERENCES library_version(id),
