@@ -20,11 +20,11 @@ CREATE TABLE control_family (
     name            TEXT NOT NULL            -- 'Access Control'
 );
 
--- NOTE: id alone is the primary key, so each requirement/objective can exist under only ONE
--- library_version. A second scoring version for Rev 2 (same IDs, different weights or text)
--- can't sit beside the first. Move to (library_version, id) keys before loading a second version.
+-- Library rows are keyed by (library_version, id), so a new version can reuse the Rev 2 IDs
+-- ('3.5.3') with different weights or text and sit beside the old one. Every table that points
+-- at a requirement or objective carries library_version too.
 CREATE TABLE requirement (
-    id              TEXT PRIMARY KEY,        -- '3.5.3'
+    id              TEXT NOT NULL,           -- '3.5.3'
     library_version INT  NOT NULL REFERENCES library_version(id),
     family_code     TEXT NOT NULL REFERENCES control_family(code),
     req_type        TEXT NOT NULL CHECK (req_type IN ('basic','derived')),
@@ -37,16 +37,20 @@ CREATE TABLE requirement (
     poam_eligible   BOOLEAN NOT NULL,        -- can it sit on a POA&M under the CMMC rule? (necessary, not
                                              -- sufficient: see POA&M note in section 3)
     blocks_scoring  BOOLEAN NOT NULL DEFAULT FALSE,  -- 3.12.4: no SSP = no valid score at all
+    PRIMARY KEY (library_version, id),
     CHECK ((sprs_weight IS NOT NULL AND sprs_weight IN (1,3,5))
         OR (sprs_weight IS NULL AND blocks_scoring))
 );
 
 CREATE TABLE assessment_objective (
-    id              TEXT PRIMARY KEY,        -- '3.5.3[a]' (from 800-171A; 320 total)
-    requirement_id  TEXT NOT NULL REFERENCES requirement(id),
+    id              TEXT NOT NULL,           -- '3.5.3[a]' (from 800-171A; 320 total)
+    library_version INT  NOT NULL,
+    requirement_id  TEXT NOT NULL,
     letter          TEXT NOT NULL,           -- 'a','b','c'...
     text            TEXT NOT NULL,
-    odp             BOOLEAN NOT NULL DEFAULT FALSE  -- needs an org-defined parameter?
+    odp             BOOLEAN NOT NULL DEFAULT FALSE,  -- needs an org-defined parameter?
+    PRIMARY KEY (library_version, id),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
 
 -- Deterministic checks. Code decides these, not the model.
@@ -61,13 +65,15 @@ CREATE TABLE check_rule (
 -- How each objective CAN be evidenced. One objective -> many methods.
 CREATE TABLE evidence_method (
     id              SERIAL PRIMARY KEY,
-    objective_id    TEXT NOT NULL REFERENCES assessment_objective(id),
+    library_version INT  NOT NULL,
+    objective_id    TEXT NOT NULL,
     method_type     TEXT NOT NULL CHECK (method_type IN
                         ('automated_check','interview','document','screenshot','attestation')),
     collector       TEXT,                    -- 'graph.conditional_access', 'exo.mailbox_audit', NULL for manual
     rule_id         TEXT REFERENCES check_rule(id),   -- deterministic rule, if automated
     interview_prompt TEXT,                   -- question asked when no automated source exists
-    assessor_guidance TEXT                   -- what an assessor would want to see
+    assessor_guidance TEXT,                  -- what an assessor would want to see
+    FOREIGN KEY (library_version, objective_id) REFERENCES assessment_objective(library_version, id)
 );
 
 -- =========================================================
@@ -94,7 +100,10 @@ CREATE TABLE assessment (
     signed_by       TEXT,                    -- the human who attests (senior official for SPRS)
     signed_at       TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (status <> 'signed' OR (signed_by IS NOT NULL AND signed_at IS NOT NULL))
+    CHECK (status <> 'signed' OR (signed_by IS NOT NULL AND signed_at IS NOT NULL)),
+    -- Target for the composite FKs below: results, SSP text and POA&M items must use library rows
+    -- from this assessment's version. It also blocks changing library_version once any exist.
+    UNIQUE (id, library_version)
 );
 
 -- Raw evidence, immutable. Hash it so you can prove what you saw and when.
@@ -128,8 +137,9 @@ CREATE TRIGGER evidence_item_no_truncate BEFORE TRUNCATE ON evidence_item
 
 -- One row per objective per assessment. Three separate opinions, kept apart on purpose.
 CREATE TABLE objective_result (
-    assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    objective_id    TEXT NOT NULL REFERENCES assessment_objective(id),
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,           -- must equal the assessment's (enforced by FK)
+    objective_id    TEXT NOT NULL,
     rule_result     TEXT CHECK (rule_result IN ('met','not_met','unknown')),  -- deterministic
     ai_result       TEXT CHECK (ai_result   IN ('met','not_met','insufficient_evidence')),
     ai_rationale    TEXT,
@@ -138,6 +148,8 @@ CREATE TABLE objective_result (
     reviewer        TEXT,
     reviewed_at     TIMESTAMPTZ,
     PRIMARY KEY (assessment_id, objective_id),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, objective_id) REFERENCES assessment_objective(library_version, id),
     CHECK (human_result IS NULL OR (reviewer IS NOT NULL AND reviewed_at IS NOT NULL)),
     CHECK (ai_result IS NULL OR ai_model IS NOT NULL)
 );
@@ -172,25 +184,31 @@ CREATE TRIGGER objective_evidence_lock BEFORE INSERT OR UPDATE OR DELETE ON obje
 
 -- SSP narrative per requirement (AI drafts, human edits).
 CREATE TABLE ssp_narrative (
-    assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    requirement_id  TEXT NOT NULL REFERENCES requirement(id),
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,           -- must equal the assessment's (enforced by FK)
+    requirement_id  TEXT NOT NULL,
     draft_text      TEXT,
     final_text      TEXT,
     edited_by       TEXT,
-    PRIMARY KEY (assessment_id, requirement_id)
+    PRIMARY KEY (assessment_id, requirement_id),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
 
 CREATE TABLE poam_item (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    assessment_id   UUID NOT NULL REFERENCES assessment(id),
-    requirement_id  TEXT NOT NULL REFERENCES requirement(id),
+    assessment_id   UUID NOT NULL,
+    library_version INT  NOT NULL,           -- must equal the assessment's (enforced by FK)
+    requirement_id  TEXT NOT NULL,
     weakness        TEXT NOT NULL,
     remediation     TEXT NOT NULL,
     est_cost_usd    NUMERIC(10,2),
     points_recovered SMALLINT,               -- drives the "fix this first" ranking
     owner           TEXT,
     due_date        DATE,
-    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','in_progress','closed'))
+    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','in_progress','closed')),
+    FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
 
 -- =========================================================
@@ -203,6 +221,7 @@ CREATE TABLE poam_item (
 CREATE VIEW requirement_status AS
 SELECT
     a.id AS assessment_id,
+    a.library_version,
     r.id AS requirement_id,
     r.sprs_weight,
     r.partial_rule,
@@ -218,9 +237,10 @@ SELECT
     END AS status
 FROM assessment a
 JOIN requirement r                ON r.library_version = a.library_version
-LEFT JOIN assessment_objective ao ON ao.requirement_id = r.id
-LEFT JOIN objective_result o      ON o.assessment_id = a.id AND o.objective_id = ao.id
-GROUP BY a.id, r.id;
+LEFT JOIN assessment_objective ao ON ao.library_version = r.library_version AND ao.requirement_id = r.id
+LEFT JOIN objective_result o      ON o.assessment_id = a.id
+                                 AND o.library_version = ao.library_version AND o.objective_id = ao.id
+GROUP BY a.id, r.library_version, r.id;
 
 -- Final SPRS math (110 minus deductions, floor -203) lives in application code,
 -- where partial_rule can be evaluated and unit-tested against known examples.
