@@ -111,6 +111,27 @@ CREATE TABLE assessment (
     UNIQUE (id, library_version)
 );
 
+-- A signed assessment can't be un-signed or edited (that would lift every lock below and
+-- rewrite the attestation). Its only allowed change is signed -> superseded, with every other
+-- column unchanged; superseded is final. Neither can be deleted. No-op updates pass.
+CREATE FUNCTION guard_signed_assessment() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND to_jsonb(NEW) = to_jsonb(OLD) THEN
+        RETURN NEW;
+    END IF;
+    IF OLD.status = 'superseded'
+       OR (OLD.status = 'signed' AND (TG_OP = 'DELETE'
+                                      OR NEW.status <> 'superseded'
+                                      OR to_jsonb(NEW) - 'status' <> to_jsonb(OLD) - 'status')) THEN
+        RAISE EXCEPTION '% on assessment % rejected: it is %; the only allowed change is signed -> superseded',
+            TG_OP, OLD.id, OLD.status;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+CREATE TRIGGER assessment_signed_guard BEFORE UPDATE OR DELETE ON assessment
+    FOR EACH ROW EXECUTE FUNCTION guard_signed_assessment();
+
 -- Freeze a library version once any assessment on it is signed or superseded: no inserts,
 -- updates or deletes of its requirements, objectives, rules or evidence methods, or of the
 -- library_version row itself. A signed assessment's scoring view and rule logic are read live
@@ -131,13 +152,12 @@ BEGIN
     RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END $$;
 
--- TRUNCATE skips row triggers (and TRUNCATE ... CASCADE reaches the result tables),
--- so refuse it outright once anything is signed.
-CREATE FUNCTION reject_library_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
+-- TRUNCATE skips row triggers (and TRUNCATE ... CASCADE reaches the result tables), so the
+-- library, result and assessment tables refuse it outright once anything is signed.
+CREATE FUNCTION reject_truncate_if_signed() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF EXISTS (SELECT 1 FROM assessment WHERE status IN ('signed','superseded')) THEN
-        RAISE EXCEPTION 'TRUNCATE on % rejected: library versions are frozen by signed or superseded assessments',
-            TG_TABLE_NAME;
+        RAISE EXCEPTION 'TRUNCATE on % rejected: signed or superseded assessments exist', TG_TABLE_NAME;
     END IF;
     RETURN NULL;
 END $$;
@@ -154,15 +174,15 @@ CREATE TRIGGER evidence_method_freeze BEFORE INSERT OR UPDATE OR DELETE ON evide
     FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
 
 CREATE TRIGGER library_version_no_truncate BEFORE TRUNCATE ON library_version
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 CREATE TRIGGER requirement_no_truncate BEFORE TRUNCATE ON requirement
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 CREATE TRIGGER assessment_objective_no_truncate BEFORE TRUNCATE ON assessment_objective
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 CREATE TRIGGER check_rule_no_truncate BEFORE TRUNCATE ON check_rule
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 CREATE TRIGGER evidence_method_no_truncate BEFORE TRUNCATE ON evidence_method
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 
 -- Raw evidence, immutable. Hash it so you can prove what you saw and when.
 -- Hash the raw bytes as received and keep those bytes at file_uri. Don't hash payload:
@@ -239,6 +259,13 @@ CREATE TRIGGER objective_result_lock BEFORE INSERT OR UPDATE OR DELETE ON object
     FOR EACH ROW EXECUTE FUNCTION reject_change_if_signed();
 CREATE TRIGGER objective_evidence_lock BEFORE INSERT OR UPDATE OR DELETE ON objective_evidence
     FOR EACH ROW EXECUTE FUNCTION reject_change_if_signed();
+
+CREATE TRIGGER objective_result_no_truncate BEFORE TRUNCATE ON objective_result
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER objective_evidence_no_truncate BEFORE TRUNCATE ON objective_evidence
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER assessment_no_truncate BEFORE TRUNCATE ON assessment
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 
 -- SSP narrative per requirement (AI drafts, human edits).
 CREATE TABLE ssp_narrative (
