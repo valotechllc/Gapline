@@ -138,7 +138,7 @@ CREATE TRIGGER evidence_item_no_truncate BEFORE TRUNCATE ON evidence_item
 -- One row per objective per assessment. Three separate opinions, kept apart on purpose.
 CREATE TABLE objective_result (
     assessment_id   UUID NOT NULL,
-    library_version INT  NOT NULL,           -- must equal the assessment's (enforced by FK)
+    library_version INT  NOT NULL,           -- filled from the assessment if omitted; must match it (FK)
     objective_id    TEXT NOT NULL,
     rule_result     TEXT CHECK (rule_result IN ('met','not_met','unknown')),  -- deterministic
     ai_result       TEXT CHECK (ai_result   IN ('met','not_met','insufficient_evidence')),
@@ -185,7 +185,7 @@ CREATE TRIGGER objective_evidence_lock BEFORE INSERT OR UPDATE OR DELETE ON obje
 -- SSP narrative per requirement (AI drafts, human edits).
 CREATE TABLE ssp_narrative (
     assessment_id   UUID NOT NULL,
-    library_version INT  NOT NULL,           -- must equal the assessment's (enforced by FK)
+    library_version INT  NOT NULL,           -- filled from the assessment if omitted; must match it (FK)
     requirement_id  TEXT NOT NULL,
     draft_text      TEXT,
     final_text      TEXT,
@@ -198,7 +198,7 @@ CREATE TABLE ssp_narrative (
 CREATE TABLE poam_item (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     assessment_id   UUID NOT NULL,
-    library_version INT  NOT NULL,           -- must equal the assessment's (enforced by FK)
+    library_version INT  NOT NULL,           -- filled from the assessment if omitted; must match it (FK)
     requirement_id  TEXT NOT NULL,
     weakness        TEXT NOT NULL,
     remediation     TEXT NOT NULL,
@@ -210,6 +210,28 @@ CREATE TABLE poam_item (
     FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
     FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
 );
+
+-- Callers may omit library_version: copy it from the assessment. An explicit value is kept
+-- as given, so a wrong one still fails the FK instead of being silently corrected.
+-- (BEFORE triggers run ahead of the NOT NULL check, so the column can stay NOT NULL.)
+CREATE FUNCTION fill_library_version() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.library_version IS NULL THEN
+        SELECT library_version INTO NEW.library_version FROM assessment WHERE id = NEW.assessment_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'insert on %: assessment % does not exist', TG_TABLE_NAME, NEW.assessment_id
+                USING ERRCODE = 'foreign_key_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER objective_result_fill_version BEFORE INSERT ON objective_result
+    FOR EACH ROW EXECUTE FUNCTION fill_library_version();
+CREATE TRIGGER ssp_narrative_fill_version BEFORE INSERT ON ssp_narrative
+    FOR EACH ROW EXECUTE FUNCTION fill_library_version();
+CREATE TRIGGER poam_item_fill_version BEFORE INSERT ON poam_item
+    FOR EACH ROW EXECUTE FUNCTION fill_library_version();
 
 -- =========================================================
 -- 3. SCORING — derived only from HUMAN results
