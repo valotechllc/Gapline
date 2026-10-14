@@ -15,18 +15,21 @@ CREATE TABLE library_version (
     notes           TEXT
 );
 
+-- Library rows (families, requirements, objectives, check rules) are keyed by
+-- (library_version, id), so a new version can reuse the Rev 2 IDs ('3.5.3', 'IA') with different
+-- weights, names or text and sit beside the old one. Every table that points at a library row
+-- carries library_version too.
 CREATE TABLE control_family (
-    code            TEXT PRIMARY KEY,        -- 'AC', 'IA', 'SC' ...
-    name            TEXT NOT NULL            -- 'Access Control'
+    code            TEXT NOT NULL,           -- 'AC', 'IA', 'SC' ...
+    library_version INT  NOT NULL REFERENCES library_version(id),
+    name            TEXT NOT NULL,           -- 'Access Control'
+    PRIMARY KEY (library_version, code)
 );
 
--- Library rows are keyed by (library_version, id), so a new version can reuse the Rev 2 IDs
--- ('3.5.3') with different weights or text and sit beside the old one. Every table that points
--- at a requirement, objective or check rule carries library_version too.
 CREATE TABLE requirement (
     id              TEXT NOT NULL,           -- '3.5.3'
     library_version INT  NOT NULL REFERENCES library_version(id),
-    family_code     TEXT NOT NULL REFERENCES control_family(code),
+    family_code     TEXT NOT NULL,           -- family in the same library_version
     req_type        TEXT NOT NULL CHECK (req_type IN ('basic','derived')),
     title           TEXT NOT NULL,
     statement       TEXT NOT NULL,           -- official requirement text
@@ -38,6 +41,7 @@ CREATE TABLE requirement (
                                              -- sufficient: see POA&M note in section 3)
     blocks_scoring  BOOLEAN NOT NULL DEFAULT FALSE,  -- 3.12.4: no SSP = no valid score at all
     PRIMARY KEY (library_version, id),
+    FOREIGN KEY (library_version, family_code) REFERENCES control_family(library_version, code),
     CHECK ((sprs_weight IS NOT NULL AND sprs_weight IN (1,3,5))
         OR (sprs_weight IS NULL AND blocks_scoring))
 );
@@ -141,8 +145,8 @@ CREATE TRIGGER assessment_signed_guard BEFORE INSERT OR UPDATE OR DELETE ON asse
     FOR EACH ROW EXECUTE FUNCTION guard_signed_assessment();
 
 -- Freeze a library version once any assessment on it is signed or superseded: no inserts,
--- updates or deletes of its requirements, objectives, rules or evidence methods, or of the
--- library_version row itself. A signed assessment's scoring view and rule logic are read live
+-- updates or deletes of its families, requirements, objectives, rules or evidence methods, or
+-- of the library_version row itself. A signed assessment's scoring view and rule logic are read live
 -- from these rows, so editing them would change what was attested. Fix mistakes in a new version.
 -- Like the other guards, this only binds roles that don't own the tables.
 CREATE FUNCTION reject_frozen_library_change() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -172,6 +176,8 @@ END $$;
 
 CREATE TRIGGER library_version_freeze BEFORE INSERT OR UPDATE OR DELETE ON library_version
     FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change('id');
+CREATE TRIGGER control_family_freeze BEFORE INSERT OR UPDATE OR DELETE ON control_family
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
 CREATE TRIGGER requirement_freeze BEFORE INSERT OR UPDATE OR DELETE ON requirement
     FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
 CREATE TRIGGER assessment_objective_freeze BEFORE INSERT OR UPDATE OR DELETE ON assessment_objective
@@ -183,6 +189,8 @@ CREATE TRIGGER evidence_method_freeze BEFORE INSERT OR UPDATE OR DELETE ON evide
 
 CREATE TRIGGER library_version_no_truncate BEFORE TRUNCATE ON library_version
     FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
+CREATE TRIGGER control_family_no_truncate BEFORE TRUNCATE ON control_family
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 CREATE TRIGGER requirement_no_truncate BEFORE TRUNCATE ON requirement
     FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 CREATE TRIGGER assessment_objective_no_truncate BEFORE TRUNCATE ON assessment_objective
@@ -190,26 +198,6 @@ CREATE TRIGGER assessment_objective_no_truncate BEFORE TRUNCATE ON assessment_ob
 CREATE TRIGGER check_rule_no_truncate BEFORE TRUNCATE ON check_rule
     FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 CREATE TRIGGER evidence_method_no_truncate BEFORE TRUNCATE ON evidence_method
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
-
--- control_family isn't versioned, so it freezes per row: a family can't be renamed, re-coded
--- or deleted once a requirement in a frozen version belongs to it. New families can always be
--- added, and families used only by unfrozen versions stay editable.
-CREATE FUNCTION reject_frozen_family_change() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM requirement r
-               JOIN assessment a ON a.library_version = r.library_version
-               WHERE a.status IN ('signed','superseded')
-                 AND r.family_code = OLD.code) THEN
-        RAISE EXCEPTION '% on control_family % rejected: used by a library version frozen by a signed or superseded assessment',
-            TG_OP, OLD.code;
-    END IF;
-    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
-END $$;
-
-CREATE TRIGGER control_family_freeze BEFORE UPDATE OR DELETE ON control_family
-    FOR EACH ROW EXECUTE FUNCTION reject_frozen_family_change();
-CREATE TRIGGER control_family_no_truncate BEFORE TRUNCATE ON control_family
     FOR EACH STATEMENT EXECUTE FUNCTION reject_truncate_if_signed();
 
 -- Raw evidence, immutable. Hash it so you can prove what you saw and when.
@@ -478,8 +466,13 @@ GROUP BY a.id, r.library_version, r.id;
 -- =========================================================
 -- 4. EXAMPLE SEED ROWS
 -- =========================================================
-INSERT INTO control_family VALUES ('IA','Identification and Authentication'),
-                                  ('SC','System and Communications Protection');
+INSERT INTO library_version (framework, revision, methodology, effective_date)
+VALUES ('NIST SP 800-171', 'Rev 2', 'DoD Assessment Methodology v1.2.1', '2020-06-24');  -- verify date
+
+INSERT INTO control_family (code, library_version, name)
+SELECT f.code, currval('library_version_id_seq'), f.name
+FROM (VALUES ('IA','Identification and Authentication'),
+             ('SC','System and Communications Protection')) AS f(code, name);
 
 -- 3.5.3: -5 if no MFA; -3 if MFA for remote + privileged but not all network access
 -- 3.13.11: -5 if no encryption on CUI; -3 if encryption used but not FIPS-validated
