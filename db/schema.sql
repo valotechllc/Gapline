@@ -111,6 +111,59 @@ CREATE TABLE assessment (
     UNIQUE (id, library_version)
 );
 
+-- Freeze a library version once any assessment on it is signed or superseded: no inserts,
+-- updates or deletes of its requirements, objectives, rules or evidence methods, or of the
+-- library_version row itself. A signed assessment's scoring view and rule logic are read live
+-- from these rows, so editing them would change what was attested. Fix mistakes in a new version.
+-- Like the other guards, this only binds roles that don't own the tables.
+CREATE FUNCTION reject_frozen_library_change() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    col TEXT := COALESCE(TG_ARGV[0], 'library_version');  -- library_version's own key is 'id'
+BEGIN
+    IF EXISTS (SELECT 1 FROM assessment
+               WHERE status IN ('signed','superseded')
+                 AND library_version IN (
+                     CASE WHEN TG_OP <> 'INSERT' THEN (to_jsonb(OLD) ->> col)::int END,
+                     CASE WHEN TG_OP <> 'DELETE' THEN (to_jsonb(NEW) ->> col)::int END)) THEN
+        RAISE EXCEPTION '% on % rejected: library version is frozen by a signed or superseded assessment',
+            TG_OP, TG_TABLE_NAME;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+
+-- TRUNCATE skips row triggers (and TRUNCATE ... CASCADE reaches the result tables),
+-- so refuse it outright once anything is signed.
+CREATE FUNCTION reject_library_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM assessment WHERE status IN ('signed','superseded')) THEN
+        RAISE EXCEPTION 'TRUNCATE on % rejected: library versions are frozen by signed or superseded assessments',
+            TG_TABLE_NAME;
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE TRIGGER library_version_freeze BEFORE INSERT OR UPDATE OR DELETE ON library_version
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change('id');
+CREATE TRIGGER requirement_freeze BEFORE INSERT OR UPDATE OR DELETE ON requirement
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+CREATE TRIGGER assessment_objective_freeze BEFORE INSERT OR UPDATE OR DELETE ON assessment_objective
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+CREATE TRIGGER check_rule_freeze BEFORE INSERT OR UPDATE OR DELETE ON check_rule
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+CREATE TRIGGER evidence_method_freeze BEFORE INSERT OR UPDATE OR DELETE ON evidence_method
+    FOR EACH ROW EXECUTE FUNCTION reject_frozen_library_change();
+
+CREATE TRIGGER library_version_no_truncate BEFORE TRUNCATE ON library_version
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+CREATE TRIGGER requirement_no_truncate BEFORE TRUNCATE ON requirement
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+CREATE TRIGGER assessment_objective_no_truncate BEFORE TRUNCATE ON assessment_objective
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+CREATE TRIGGER check_rule_no_truncate BEFORE TRUNCATE ON check_rule
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+CREATE TRIGGER evidence_method_no_truncate BEFORE TRUNCATE ON evidence_method
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_library_truncate();
+
 -- Raw evidence, immutable. Hash it so you can prove what you saw and when.
 -- Hash the raw bytes as received and keep those bytes at file_uri. Don't hash payload:
 -- JSONB reorders keys, strips whitespace and drops duplicate keys, so the stored payload
