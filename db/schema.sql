@@ -291,26 +291,55 @@ CREATE TABLE ssp_narrative (
 
 -- The SSP exactly as it stood when the assessment was signed: one row per ssp_narrative row,
 -- copied by trigger in the same transaction as the signing. Append-only, and only that
--- trigger may write it. A signed assessment with no rows here had no SSP sections at signing.
+-- trigger may write it.
 CREATE TABLE ssp_snapshot (
     assessment_id   UUID NOT NULL,
     library_version INT  NOT NULL,
     requirement_id  TEXT NOT NULL,
     draft_text      TEXT,
     final_text      TEXT,
+    final_sha256    TEXT CHECK (final_sha256 ~ '^[0-9a-f]{64}$'),  -- of final_text as UTF-8; NULL if no final_text
     edited_by       TEXT,
     snapshot_at     TIMESTAMPTZ NOT NULL DEFAULT now(),  -- transaction time of the signing
     PRIMARY KEY (assessment_id, requirement_id),
     FOREIGN KEY (assessment_id, library_version) REFERENCES assessment(id, library_version),
-    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id)
+    FOREIGN KEY (library_version, requirement_id) REFERENCES requirement(library_version, id),
+    CHECK ((final_text IS NULL) = (final_sha256 IS NULL))
+);
+
+-- One row per signed assessment, written with its snapshot: a single hash for the whole SSP,
+-- to print on an exported copy. A signed assessment with section_count 0 had no SSP sections;
+-- a signed assessment with no row here means the snapshot trigger didn't run.
+--
+-- sha256 is the SHA-256 (lowercase hex) of this manifest, encoded as UTF-8:
+--     one line per ssp_snapshot row, ordered by requirement_id in byte order (COLLATE "C"),
+--     each line: requirement_id, TAB, final_sha256 (or '-' if no final_text), LF.
+-- An empty SSP is the empty string. Only final_text is covered; drafts and editors are not.
+-- To verify an export: hash each section's final text, rebuild the manifest, compare.
+CREATE TABLE ssp_snapshot_digest (
+    assessment_id   UUID PRIMARY KEY REFERENCES assessment(id),
+    section_count   INT  NOT NULL,
+    sha256          TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    snapshot_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE FUNCTION snapshot_ssp_on_sign() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     INSERT INTO ssp_snapshot (assessment_id, library_version, requirement_id,
-                              draft_text, final_text, edited_by)
-    SELECT assessment_id, library_version, requirement_id, draft_text, final_text, edited_by
+                              draft_text, final_text, final_sha256, edited_by)
+    SELECT assessment_id, library_version, requirement_id, draft_text, final_text,
+           encode(sha256(convert_to(final_text, 'UTF8')), 'hex'), edited_by
     FROM ssp_narrative
+    WHERE assessment_id = NEW.id;
+
+    INSERT INTO ssp_snapshot_digest (assessment_id, section_count, sha256)
+    SELECT NEW.id,
+           count(*),
+           encode(sha256(convert_to(coalesce(
+               string_agg(requirement_id || E'\t' || coalesce(final_sha256, '-') || E'\n', ''
+                          ORDER BY requirement_id COLLATE "C"),
+               ''), 'UTF8')), 'hex')
+    FROM ssp_snapshot
     WHERE assessment_id = NEW.id;
     RETURN NULL;
 END $$;
@@ -326,7 +355,7 @@ CREATE TRIGGER assessment_ssp_snapshot AFTER UPDATE ON assessment
 CREATE FUNCTION reject_direct_snapshot_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF pg_trigger_depth() < 2 THEN
-        RAISE EXCEPTION 'ssp_snapshot is written only by signing an assessment';
+        RAISE EXCEPTION '% is written only by signing an assessment', TG_TABLE_NAME;
     END IF;
     RETURN NEW;
 END $$;
@@ -336,6 +365,13 @@ CREATE TRIGGER ssp_snapshot_insert_guard BEFORE INSERT ON ssp_snapshot
 CREATE TRIGGER ssp_snapshot_no_update_delete BEFORE UPDATE OR DELETE ON ssp_snapshot
     FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
 CREATE TRIGGER ssp_snapshot_no_truncate BEFORE TRUNCATE ON ssp_snapshot
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
+
+CREATE TRIGGER ssp_snapshot_digest_insert_guard BEFORE INSERT ON ssp_snapshot_digest
+    FOR EACH ROW EXECUTE FUNCTION reject_direct_snapshot_insert();
+CREATE TRIGGER ssp_snapshot_digest_no_update_delete BEFORE UPDATE OR DELETE ON ssp_snapshot_digest
+    FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
+CREATE TRIGGER ssp_snapshot_digest_no_truncate BEFORE TRUNCATE ON ssp_snapshot_digest
     FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
 
 CREATE TABLE poam_item (
