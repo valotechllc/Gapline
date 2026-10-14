@@ -107,10 +107,18 @@ SELECT t_raises('families cannot be truncated',
 SELECT t_raises('requirements cannot be truncated',
     $$TRUNCATE requirement CASCADE$$, 'TRUNCATE on requirement rejected');
 
--- superseded freezes too
+-- superseding keeps the freeze
+UPDATE assessment SET status = 'signed', signed_by = 'CEO', signed_at = now()
+WHERE id = '10000000-0000-0000-0000-00000000000c';
 UPDATE assessment SET status = 'superseded' WHERE id = '10000000-0000-0000-0000-00000000000c';
-SELECT t_raises('a version whose only assessment is superseded is frozen too',
+SELECT t_raises('a version stays frozen after its only signed assessment is superseded',
     $$UPDATE check_rule SET logic = '{}' WHERE library_version = 2$$, 'UPDATE on check_rule rejected');
 SELECT t_raises('... including its families',
     $$UPDATE control_family SET name = 'again' WHERE library_version = 2 AND code = 'RA'$$,
     'UPDATE on control_family rejected');
+
+SET ROLE pg_write_all_data;
+SELECT t_raises('for a non-owner, the freeze still holds',
+    $$INSERT INTO requirement VALUES ('3.1.2', 1, 'IA', 'basic', 'x', 'x', NULL, 5, NULL, false, false)$$,
+    'INSERT on requirement rejected: library version is frozen');
+RESET ROLE;

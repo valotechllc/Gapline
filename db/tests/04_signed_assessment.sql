@@ -10,6 +10,10 @@ SELECT t_raises('an assessment cannot be created already signed',
     $$INSERT INTO assessment (org_id, library_version, status, signed_by, signed_at)
       VALUES ('00000000-0000-0000-0000-0000000000a1', 1, 'signed', 'CEO', now())$$,
     'create it unsigned, then sign it by update');
+SELECT t_raises('an assessment cannot be created already superseded',
+    $$INSERT INTO assessment (org_id, library_version, status)
+      VALUES ('00000000-0000-0000-0000-0000000000a1', 1, 'superseded')$$,
+    'create it unsigned, then sign it by update');
 
 INSERT INTO assessment (id, org_id, library_version, scope_notes) VALUES
     ('10000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-0000000000a1', 1, 'scope A'),
@@ -103,8 +107,11 @@ SELECT t_ok('an unsigned assessment''s results can be added, changed and removed
       UPDATE objective_result SET human_result = 'met', reviewer = 'r', reviewed_at = now()
           WHERE assessment_id = '10000000-0000-0000-0000-00000000000b';
       DELETE FROM objective_result WHERE assessment_id = '10000000-0000-0000-0000-00000000000b'$$);
-SELECT t_ok('an unsigned assessment can be superseded directly',
-    $$UPDATE assessment SET status = 'superseded' WHERE id = '10000000-0000-0000-0000-00000000000b'$$);
+SELECT t_raises('an unsigned assessment cannot be superseded (nothing was attested)',
+    $$UPDATE assessment SET status = 'superseded' WHERE id = '10000000-0000-0000-0000-00000000000b'$$,
+    'only a signed assessment can be superseded');
+SELECT t_ok('an unsigned assessment can be deleted instead',
+    $$DELETE FROM assessment WHERE id = '10000000-0000-0000-0000-00000000000b'$$);
 
 SELECT t_eq('the superseded assessment kept its signer, scope and result',
             (SELECT status || '|' || signed_by || '|' || scope_notes FROM assessment
@@ -112,3 +119,21 @@ SELECT t_eq('the superseded assessment kept its signer, scope and result',
             || '|' || (SELECT human_result FROM objective_result
                        WHERE assessment_id = '10000000-0000-0000-0000-00000000000a'),
             'superseded|CEO|scope A|not_met');
+
+-- The guards still fire for a non-owner role, although it has no EXECUTE on the guard
+-- functions (pg_write_all_data stands in for an app role with write access).
+SET ROLE pg_write_all_data;
+SELECT t_raises('for a non-owner: no results can be added to a signed or superseded assessment',
+    $$INSERT INTO objective_result (assessment_id, library_version, objective_id)
+      VALUES ('10000000-0000-0000-0000-00000000000a', 1, '3.5.3[b]')$$,
+    'INSERT on objective_result rejected');
+SELECT t_raises('for a non-owner: an assessment cannot be created superseded',
+    $$INSERT INTO assessment (org_id, library_version, status)
+      VALUES ('00000000-0000-0000-0000-0000000000a1', 1, 'superseded')$$,
+    'create it unsigned, then sign it by update');
+SELECT t_raises('for a non-owner: a temp table named assessment cannot stand in for the real one in the guards',
+    $$CREATE TEMP TABLE assessment (id UUID, status TEXT, library_version INT);
+      INSERT INTO objective_result (assessment_id, library_version, objective_id)
+      VALUES ('10000000-0000-0000-0000-00000000000a', 1, '3.5.3[b]')$$,
+    'INSERT on objective_result rejected');
+RESET ROLE;

@@ -119,12 +119,20 @@ CREATE TABLE assessment (
 -- A signed assessment can't be un-signed or edited (that would lift every lock below and
 -- rewrite the attestation). Its only allowed change is signed -> superseded, with every other
 -- column unchanged; superseded is final. Neither can be deleted. No-op updates pass.
--- Assessments can't be created already signed: signing must be an update, so the SSP
--- snapshot trigger (see ssp_snapshot) runs for every signed assessment.
-CREATE FUNCTION guard_signed_assessment() RETURNS trigger LANGUAGE plpgsql AS $$
+-- Assessments can't be created signed or superseded, and only a signed assessment can be
+-- superseded: signing must be an update, so the SSP snapshot trigger (see ssp_snapshot) runs
+-- for every signed assessment, and 'superseded' always means "was signed".
+--
+-- Signing also takes a SHARE lock on the assessment's library_version row. Library edits lock
+-- that row too (reject_frozen_library_change), so an edit and a signing on the same version
+-- can't overlap: the later one waits for the earlier to commit, then sees it.
+-- The concurrency guards here assume READ COMMITTED, PostgreSQL's default. Under REPEATABLE
+-- READ the result locks still fail safe (serialization error), but a library edit whose
+-- snapshot predates a concurrent signing is not caught.
+CREATE FUNCTION guard_signed_assessment() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        IF NEW.status = 'signed' THEN
+        IF NEW.status IN ('signed', 'superseded') THEN
             RAISE EXCEPTION 'insert on assessment rejected: create it unsigned, then sign it by update';
         END IF;
         RETURN NEW;
@@ -139,6 +147,12 @@ BEGIN
         RAISE EXCEPTION '% on assessment % rejected: it is %; the only allowed change is signed -> superseded',
             TG_OP, OLD.id, OLD.status;
     END IF;
+    IF TG_OP = 'UPDATE' AND NEW.status = 'superseded' AND OLD.status <> 'signed' THEN
+        RAISE EXCEPTION 'update on assessment % rejected: only a signed assessment can be superseded', OLD.id;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.status = 'signed' AND OLD.status <> 'signed' THEN
+        PERFORM 1 FROM library_version WHERE id = NEW.library_version FOR SHARE;
+    END IF;
     RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END $$;
 
@@ -150,15 +164,18 @@ CREATE TRIGGER assessment_signed_guard BEFORE INSERT OR UPDATE OR DELETE ON asse
 -- of the library_version row itself. A signed assessment's scoring view and rule logic are read live
 -- from these rows, so editing them would change what was attested. Fix mistakes in a new version.
 -- Like the other guards, this only binds roles that don't own the tables.
-CREATE FUNCTION reject_frozen_library_change() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION reject_frozen_library_change() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE
-    col TEXT := COALESCE(TG_ARGV[0], 'library_version');  -- library_version's own key is 'id'
+    col      TEXT := COALESCE(TG_ARGV[0], 'library_version');  -- library_version's own key is 'id'
+    versions INT[] := ARRAY[CASE WHEN TG_OP <> 'INSERT' THEN (to_jsonb(OLD) ->> col)::int END,
+                            CASE WHEN TG_OP <> 'DELETE' THEN (to_jsonb(NEW) ->> col)::int END];
 BEGIN
+    -- Conflicts with the SHARE lock a signing takes (guard_signed_assessment): wait for an
+    -- in-flight signing to commit and then see it, or make a new signing wait for this edit.
+    PERFORM 1 FROM library_version WHERE id = ANY (versions) ORDER BY id FOR NO KEY UPDATE;
     IF EXISTS (SELECT 1 FROM assessment
                WHERE status IN ('signed','superseded')
-                 AND library_version IN (
-                     CASE WHEN TG_OP <> 'INSERT' THEN (to_jsonb(OLD) ->> col)::int END,
-                     CASE WHEN TG_OP <> 'DELETE' THEN (to_jsonb(NEW) ->> col)::int END)) THEN
+                 AND library_version = ANY (versions)) THEN
         RAISE EXCEPTION '% on % rejected: library version is frozen by a signed or superseded assessment',
             TG_OP, TG_TABLE_NAME;
     END IF;
@@ -261,12 +278,18 @@ CREATE TABLE objective_evidence (            -- which evidence supports which ob
 
 -- Once an assessment is signed, the results it attests to can't change underneath the signature.
 -- To revise, start a new assessment and mark the old one 'superseded'.
-CREATE FUNCTION reject_change_if_signed() RETURNS trigger LANGUAGE plpgsql AS $$
+-- The SHARE lock on the assessment row conflicts with the UPDATE that signs it: an edit waits
+-- for an in-flight signing to commit and then sees it, and a signing waits for open edits.
+-- Concurrent edits to an unsigned assessment don't block each other.
+CREATE FUNCTION reject_change_if_signed() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+    ids UUID[] := ARRAY[CASE WHEN TG_OP <> 'INSERT' THEN OLD.assessment_id END,
+                        CASE WHEN TG_OP <> 'DELETE' THEN NEW.assessment_id END];
 BEGIN
+    PERFORM 1 FROM assessment WHERE id = ANY (ids) ORDER BY id FOR SHARE;
     IF EXISTS (SELECT 1 FROM assessment
                WHERE status IN ('signed','superseded')
-                 AND id IN (CASE WHEN TG_OP <> 'INSERT' THEN OLD.assessment_id END,
-                            CASE WHEN TG_OP <> 'DELETE' THEN NEW.assessment_id END)) THEN
+                 AND id = ANY (ids)) THEN
         RAISE EXCEPTION '% on % rejected: assessment is signed or superseded', TG_OP, TG_TABLE_NAME;
     END IF;
     RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
@@ -332,8 +355,13 @@ CREATE TABLE ssp_snapshot_digest (
     snapshot_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE FUNCTION snapshot_ssp_on_sign() RETURNS trigger LANGUAGE plpgsql AS $$
+-- Runs as the owner (SECURITY DEFINER), so the app role needs no INSERT privilege on the
+-- snapshot tables, and only works as a trigger on assessment.
+CREATE FUNCTION snapshot_ssp_on_sign() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
 BEGIN
+    IF TG_RELID <> 'assessment'::regclass THEN
+        RAISE EXCEPTION 'snapshot_ssp_on_sign must be a trigger on assessment';
+    END IF;
     INSERT INTO ssp_snapshot (assessment_id, library_version, requirement_id,
                               draft_text, final_text, final_sha256, edited_by)
     SELECT assessment_id, library_version, requirement_id, draft_text, final_text,
@@ -359,11 +387,13 @@ CREATE TRIGGER assessment_ssp_snapshot AFTER UPDATE ON assessment
     FOR EACH ROW WHEN (OLD.status <> 'signed' AND NEW.status = 'signed')
     EXECUTE FUNCTION snapshot_ssp_on_sign();
 
--- Rows may only come from snapshot_ssp_on_sign: a direct INSERT runs at trigger depth 1,
--- the copy inside the signing trigger at depth 2. Stops backfilled or invented snapshots.
+-- Rows may only come from snapshot_ssp_on_sign, which writes as the table owner from inside a
+-- trigger. Any other role is refused even with INSERT privilege, including from a trigger of
+-- its own; a direct INSERT (trigger depth 1) is refused even for the owner.
 CREATE FUNCTION reject_direct_snapshot_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    IF pg_trigger_depth() < 2 THEN
+    IF pg_trigger_depth() < 2
+       OR current_user <> (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = TG_RELID) THEN
         RAISE EXCEPTION '% is written only by signing an assessment', TG_TABLE_NAME;
     END IF;
     RETURN NEW;
@@ -382,6 +412,22 @@ CREATE TRIGGER ssp_snapshot_digest_no_update_delete BEFORE UPDATE OR DELETE ON s
     FOR EACH ROW EXECUTE FUNCTION reject_append_only_change();
 CREATE TRIGGER ssp_snapshot_digest_no_truncate BEFORE TRUNCATE ON ssp_snapshot_digest
     FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_change();
+
+-- The SECURITY DEFINER functions run with the owner's rights: to take row locks the app role
+-- couldn't (FOR SHARE needs UPDATE privilege) and to write snapshots it can't. Pin their
+-- search_path to this schema with pg_temp last, so a caller's temp tables can't stand in for
+-- ours, and take EXECUTE away from PUBLIC so nobody can attach them to other tables. (Triggers
+-- don't check EXECUTE when they fire, so the triggers above keep working for every role.)
+DO $$
+DECLARE
+    fn TEXT;
+BEGIN
+    FOREACH fn IN ARRAY ARRAY['guard_signed_assessment()', 'reject_frozen_library_change()',
+                              'reject_change_if_signed()', 'snapshot_ssp_on_sign()'] LOOP
+        EXECUTE format('ALTER FUNCTION %s SET search_path = %I, pg_temp', fn, current_schema());
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', fn);
+    END LOOP;
+END $$;
 
 CREATE TABLE poam_item (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),

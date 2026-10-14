@@ -12,9 +12,10 @@ The runner exits non-zero if any file fails. In CI, `.github/workflows/db-tests.
 
 ## Requirements
 
-- `psql`, `createdb` and `dropdb` on the `PATH`.
-- A role that can create databases. Connection settings come from the usual libpq variables (`PGHOST`, `PGPORT`, `PGUSER`, ...).
-- PostgreSQL 15 or later, with ICU. `07_ssp_digest_collation` creates an ICU `en-US` database.
+- `psql`, `createdb` and `dropdb` on the `PATH`. Connection settings come from the usual libpq variables (`PGHOST`, `PGPORT`, `PGUSER`, ...).
+- A superuser. Some checks switch to the built-in `pg_write_all_data` role to act as a non-owner app role, and `09_signing_concurrency` creates the `dblink` extension.
+- PostgreSQL 15 or later, with ICU and the contrib extensions (both standard in the official images and most packages). `07_ssp_digest_collation` creates an ICU `en-US` database.
+- For `09_signing_concurrency`, local Unix-socket connections that don't need a password (trust or peer), because it opens extra sessions from inside the server.
 
 ## Writing checks
 
@@ -37,10 +38,11 @@ A file can request database options with a first line like `-- createdb-options:
 | `01_scoring_view` | `requirement_status`: partial reviews stay `unreviewed`; no requirement drops out of the view |
 | `02_integrity_checks` | Weights, reviewer and model attribution, signer, evidence hashes and raw bytes, evidence pinned to its assessment, append-only evidence |
 | `03_library_versioning` | `(library_version, id)` keys, cross-version references, filling in `library_version`, the example seed |
-| `04_signed_assessment` | Result locks, signed → superseded only, no signed inserts, deletes or TRUNCATE |
+| `04_signed_assessment` | Result locks; only signed → superseded; nothing created signed or superseded; no deletes or TRUNCATE; guards hold for a non-owner role, including against a temp table that tries to stand in for `assessment` |
 | `05_library_freeze` | Every library table frozen by a signed or superseded assessment; other versions stay editable |
-| `06_ssp_snapshot` | Snapshot at signing, per-section and whole-SSP SHA-256 against values from `sha256sum`, tamper resistance |
+| `06_ssp_snapshot` | Snapshot at signing, per-section and whole-SSP SHA-256 against values from `sha256sum`, tamper resistance, no way for a non-owner role to plant snapshot rows |
 | `07_ssp_digest_collation` | The digest uses byte order regardless of the database collation |
 | `08_clone_library_version` | Exact copies, version-local references, defaults and overrides, rollback, newly added columns |
+| `09_signing_concurrency` | Signing serializes with concurrent result edits and library edits, in both orders; edits to an unsigned assessment don't block each other |
 
 The expected hashes in `06` and `07` were computed with `sha256sum`, outside Postgres. The commands are in each file's header comment, so the tests check the documented format rather than the database agreeing with itself.

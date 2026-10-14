@@ -20,13 +20,15 @@ INSERT INTO organization (id, legal_name) VALUES ('00000000-0000-0000-0000-00000
 INSERT INTO assessment (id, org_id, library_version) VALUES
     ('10000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-0000000000a1', 1),
     ('10000000-0000-0000-0000-00000000000b', '00000000-0000-0000-0000-0000000000a1', 1),
-    ('10000000-0000-0000-0000-00000000000c', '00000000-0000-0000-0000-0000000000a1', 1);
+    ('10000000-0000-0000-0000-00000000000c', '00000000-0000-0000-0000-0000000000a1', 1),
+    ('10000000-0000-0000-0000-00000000000e', '00000000-0000-0000-0000-0000000000a1', 1);
 INSERT INTO ssp_narrative (assessment_id, requirement_id, draft_text, final_text, edited_by) VALUES
     ('10000000-0000-0000-0000-00000000000a', '3.5.3',   'AI draft', E'MFA — enforced for all users (café ✓)', 'alice'),
     ('10000000-0000-0000-0000-00000000000a', '3.12.4',  'AI draft', E'SSP v1.0\n\tApproved 2026-10-01', 'alice'),
     ('10000000-0000-0000-0000-00000000000a', '3.13.11', 'draft only, never finalized', NULL, 'alice'),
     ('10000000-0000-0000-0000-00000000000a', '3.1.1',   'AI draft', '', 'alice'),
-    ('10000000-0000-0000-0000-00000000000c', '3.5.3',   'd', 'MFA text for C', 'carol');
+    ('10000000-0000-0000-0000-00000000000c', '3.5.3',   'd', 'MFA text for C', 'carol'),
+    ('10000000-0000-0000-0000-00000000000e', '3.5.3',   'd', 'the real section', 'erin');
 
 SELECT t_raises('a snapshot cannot be inserted directly',
     $$INSERT INTO ssp_snapshot (assessment_id, library_version, requirement_id, final_text)
@@ -123,3 +125,48 @@ UPDATE assessment SET status = 'superseded' WHERE id = '10000000-0000-0000-0000-
 SELECT t_eq('superseding takes no new snapshot',
             (SELECT count(*) FROM ssp_snapshot WHERE assessment_id = '10000000-0000-0000-0000-00000000000a')
           + (SELECT count(*) FROM ssp_snapshot_digest WHERE assessment_id = '10000000-0000-0000-0000-00000000000a'), 5);
+
+-- A non-owner role with write access (pg_write_all_data stands in for the app role) can't
+-- get rows into a snapshot ahead of the signing: not directly, not from a trigger of its own,
+-- and not by attaching the signing function to a table it controls. (The table owner can
+-- bypass every guard here, like everywhere else in the schema.)
+SET ROLE pg_write_all_data;
+SELECT t_raises('a non-owner with INSERT privilege cannot insert a snapshot row',
+    $$INSERT INTO ssp_snapshot (assessment_id, library_version, requirement_id, final_text)
+      VALUES ('10000000-0000-0000-0000-00000000000e', 1, '3.13.11', 'invented')$$,
+    'ssp_snapshot is written only by signing an assessment');
+SELECT t_raises('... nor plant one from a trigger of its own (trigger depth 2)',
+    $$CREATE TEMP TABLE smuggle (x INT);
+      CREATE FUNCTION pg_temp.smuggle() RETURNS trigger LANGUAGE plpgsql AS $f$
+      BEGIN
+          INSERT INTO ssp_snapshot (assessment_id, library_version, requirement_id, final_text, final_sha256)
+          VALUES ('10000000-0000-0000-0000-00000000000e', 1, '3.13.11', 'invented', repeat('0', 64));
+          RETURN NULL;
+      END $f$;
+      CREATE TRIGGER smuggle AFTER INSERT ON smuggle FOR EACH ROW EXECUTE FUNCTION pg_temp.smuggle();
+      INSERT INTO smuggle VALUES (1)$$,
+    'ssp_snapshot is written only by signing an assessment');
+SELECT t_raises('... nor plant a digest that way',
+    $$CREATE TEMP TABLE smuggle (x INT);
+      CREATE FUNCTION pg_temp.smuggle() RETURNS trigger LANGUAGE plpgsql AS $f$
+      BEGIN
+          INSERT INTO ssp_snapshot_digest (assessment_id, section_count, sha256)
+          VALUES ('10000000-0000-0000-0000-00000000000e', 0, repeat('0', 64));
+          RETURN NULL;
+      END $f$;
+      CREATE TRIGGER smuggle AFTER INSERT ON smuggle FOR EACH ROW EXECUTE FUNCTION pg_temp.smuggle();
+      INSERT INTO smuggle VALUES (1)$$,
+    'ssp_snapshot_digest is written only by signing an assessment');
+SELECT t_raises('... nor attach the signing function to a table it controls',
+    $$CREATE TEMP TABLE fake_assessment (id UUID, status TEXT);
+      CREATE TRIGGER fake AFTER UPDATE ON fake_assessment FOR EACH ROW EXECUTE FUNCTION snapshot_ssp_on_sign()$$,
+    'permission denied for function snapshot_ssp_on_sign');
+RESET ROLE;
+
+UPDATE assessment SET status = 'signed', signed_by = 'CEO', signed_at = now()
+WHERE id = '10000000-0000-0000-0000-00000000000e';
+SELECT t_eq('the signed snapshot holds only the real section',
+            (SELECT string_agg(requirement_id || '=' || final_text, ',') FROM ssp_snapshot
+             WHERE assessment_id = '10000000-0000-0000-0000-00000000000e'), '3.5.3=the real section');
+SELECT t_eq('... and the digest counts only that section',
+            (SELECT section_count FROM ssp_snapshot_digest WHERE assessment_id = '10000000-0000-0000-0000-00000000000e'), 1);
